@@ -1,7 +1,15 @@
 package com.example.swingapp;
 
 import javax.swing.*;
+
+import com.example.swingapp.model.Concept;
+
 import java.awt.*;
+import java.awt.event.KeyEvent;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.awt.event.FocusAdapter;
+import java.awt.event.FocusEvent;
 import java.util.HashMap;
 import java.util.Map;
 import java.beans.PropertyChangeEvent;
@@ -10,6 +18,7 @@ import java.beans.PropertyChangeListener;
 public class ToolBarShell {
     private final JPanel toolPanel;
     private final JToolBar toolBar;
+    private MouseAdapter textPlacer;
     private final JToolBar bottomBar;
     private final DrawingCanvas canvas;
     private final Map<DrawingCanvas.Tool, JToggleButton> toolButtons = new HashMap<>();
@@ -70,11 +79,11 @@ public class ToolBarShell {
 
         // Object drawing tools
         // Rectangle button
-       JToggleButton rectBtn = new JToggleButton("Rectangle");
-       rectBtn.addActionListener(e -> canvas.setCurrentTool(DrawingCanvas.Tool.RECTANGLE));
-       toolGroup.add(rectBtn);
-       toolButtons.put(DrawingCanvas.Tool.RECTANGLE, rectBtn);
-       bottomBar.add(rectBtn);
+        JToggleButton rectBtn = new JToggleButton("Rectangle");
+        rectBtn.addActionListener(e -> canvas.setCurrentTool(DrawingCanvas.Tool.RECTANGLE));
+        toolGroup.add(rectBtn);
+        toolButtons.put(DrawingCanvas.Tool.RECTANGLE, rectBtn);
+        bottomBar.add(rectBtn);
 
         // Oval button
         JToggleButton ovalBtn = new JToggleButton("Oval");
@@ -119,15 +128,59 @@ public class ToolBarShell {
         toolButtons.put(DrawingCanvas.Tool.ARROW_OPEN, arrowOpen);
         bottomBar.add(arrowOpen);
 
-        // Stroke size slider
-        // bottomBar.addSeparator();
-        // bottomBar.add(new JLabel("Stroke: "));
-        // JSlider stroke = new JSlider(JSlider.HORIZONTAL, 1, 10, 3);
-        // stroke.setPreferredSize(new Dimension(30, 20));
-        // stroke.setMaximumSize(new Dimension(250, 20));
-        // stroke.setMinimumSize(new Dimension(10, 20));
-        // stroke.addChangeListener(e -> canvas.setStrokeWidth(stroke.getValue()));
-        // bottomBar.add(stroke);
+        // prepare text placer adapter (creates a JTextField at click point and commits on Enter/focus lost)
+        textPlacer = new MouseAdapter() {
+            @Override
+            public void mousePressed(MouseEvent e) {
+                // only react to left-click when TEXT tool is active
+                if (SwingUtilities.isLeftMouseButton(e) && canvas.getCurrentTool() == DrawingCanvas.Tool.TEXT) {
+                    final JTextField tf = new JTextField(20);
+                    // ensure absolute positioning: if canvas has a layout, switch to null layout for absolute placement
+                    if (canvas.getLayout() != null) {
+                        canvas.setLayout(null);
+                    }
+                    int prefW = 160;
+                    int prefH = 24;
+                    int x = e.getX();
+                    int y = e.getY();
+                    tf.setBounds(x, y, prefW, prefH);
+                    // show border and background
+                    tf.setOpaque(false);
+                    tf.setBackground(Color.WHITE);
+                    tf.setForeground(canvas.getDrawColor());
+                    canvas.add(tf);
+                    canvas.revalidate();
+                    canvas.repaint();
+                    tf.requestFocusInWindow();
+                    tf.selectAll();
+
+                    // finish on Enter
+                    tf.addActionListener(ae -> finishTextField(tf));
+                    // finish on focus lost
+                    tf.addFocusListener(new FocusAdapter() {
+                        @Override
+                        public void focusLost(FocusEvent fe) {
+                            finishTextField(tf);
+                        }
+                    });
+                }
+            }
+
+            private void finishTextField(JTextField tf) {
+                String text = tf.getText();
+                Rectangle bounds = tf.getBounds();
+                Container parent = tf.getParent();
+                if (parent != null) {
+                    parent.remove(tf);
+                    if (text != null && !text.trim().isEmpty()) {
+                        // add text into the canvas model (as a shape record) so it participates
+                        canvas.addTextAt(text, bounds.x, bounds.y, bounds.width, bounds.height);
+                    }
+                    parent.revalidate();
+                    parent.repaint();
+                }
+            }
+        };
 
         // listen for canvas tool changes so toolbar highlights stay in sync
         canvas.addPropertyChangeListener("currentTool", new PropertyChangeListener() {
@@ -138,6 +191,16 @@ public class ToolBarShell {
                     DrawingCanvas.Tool t = (DrawingCanvas.Tool) nv;
                     JToggleButton btn = toolButtons.get(t);
                     if (btn != null && !btn.isSelected()) btn.setSelected(true);
+
+                    // attach/remove text placer listener based on tool
+                    if (t == DrawingCanvas.Tool.TEXT) {
+                        canvas.addMouseListener(textPlacer);
+                        canvas.setCursor(Cursor.getPredefinedCursor(Cursor.TEXT_CURSOR));
+                    } else {
+                        canvas.removeMouseListener(textPlacer);
+                        // restore default cursor
+                        canvas.setCursor(Cursor.getPredefinedCursor(Cursor.DEFAULT_CURSOR));
+                    }
                 }
             }
         });
@@ -177,7 +240,7 @@ public class ToolBarShell {
 
         fileMenu.addSeparator();
 
-        JMenuItem exitItem = new JMenuItem("Exit");
+        JMenuItem exitItem = new JMenuItem("Close Window");
         exitItem.addActionListener(e -> {
             Window w = SwingUtilities.getWindowAncestor(toolPanel);
             if (w != null) w.dispose();
@@ -186,7 +249,7 @@ public class ToolBarShell {
 
         // --- Edit menu
         JMenu editMenu = new JMenu("Edit");
-        
+
         JMenuItem undoItem = new JMenuItem("Undo");
 
         // use platform menu shortcut (Ctrl on Win/Linux, Cmd on macOS)
@@ -196,14 +259,9 @@ public class ToolBarShell {
         editMenu.add(undoItem);
 
         JMenuItem redoItem = new JMenuItem("Redo");
-        redoItem.addActionListener(e -> {
-            try {
-                java.lang.reflect.Method m = canvas.getClass().getMethod("redo");
-                m.invoke(canvas);
-            } catch (Exception ex) {
-                // ignore if redo not available
-            }
-        });
+        redoItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_Y, Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()));
+        redoItem.addActionListener(e -> canvas.redo());
+        redoItem.setEnabled(canvas.canRedo());
         editMenu.add(redoItem);
 
         // --- View menu
@@ -217,10 +275,28 @@ public class ToolBarShell {
         menuBar.add(editMenu);
         menuBar.add(viewMenu);
 
+        // listen for canvas undo/redo availability changes
+        canvas.addPropertyChangeListener(new PropertyChangeListener() {
+            @Override
+            public void propertyChange(PropertyChangeEvent evt) {
+                if ("canUndo".equals(evt.getPropertyName())) {
+                    undoItem.setEnabled(Boolean.TRUE.equals(evt.getNewValue()));
+                } else if ("canRedo".equals(evt.getPropertyName())) {
+                    redoItem.setEnabled(Boolean.TRUE.equals(evt.getNewValue()));
+                }
+            }
+        });
+
         return menuBar;
     }
     
     public JComponent getToolBar() {
         return toolPanel;
     }
+
+    // Concept c = new Concept();
+    // c.setLabel("My Concept");
+    // c.put("x", 120); // geometry, or store geometry in a dedicated prop/object
+    // c.put("y", 80);
+    // model.addEntity(c);
 }
