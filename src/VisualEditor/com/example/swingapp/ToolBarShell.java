@@ -79,28 +79,35 @@ public class ToolBarShell {
 
         // Object drawing tools
         // Rectangle button
-        JToggleButton rectBtn = new JToggleButton("Rectangle");
+        JToggleButton rectBtn = new JToggleButton("Object");
         rectBtn.addActionListener(e -> canvas.setCurrentTool(DrawingCanvas.Tool.RECTANGLE));
         toolGroup.add(rectBtn);
         toolButtons.put(DrawingCanvas.Tool.RECTANGLE, rectBtn);
         bottomBar.add(rectBtn);
 
+        // State button
+        JToggleButton stateBtn = new JToggleButton("State");
+        stateBtn.addActionListener(e -> canvas.setCurrentTool(DrawingCanvas.Tool.STATE));
+        toolGroup.add(stateBtn);
+        toolButtons.put(DrawingCanvas.Tool.STATE, stateBtn);
+        bottomBar.add(stateBtn);
+
         // Oval button
-        JToggleButton ovalBtn = new JToggleButton("Oval");
+        JToggleButton ovalBtn = new JToggleButton("Task");
         ovalBtn.addActionListener(e -> canvas.setCurrentTool(DrawingCanvas.Tool.OVAL));
         toolGroup.add(ovalBtn);
         toolButtons.put(DrawingCanvas.Tool.OVAL, ovalBtn);
         bottomBar.add(ovalBtn);
 
         // Rounded Rectangle button
-        JToggleButton roundRectBtn = new JToggleButton("Rounded Rect");
+        JToggleButton roundRectBtn = new JToggleButton("Process");
         roundRectBtn.addActionListener(e -> canvas.setCurrentTool(DrawingCanvas.Tool.ROUNDED_RECTANGLE));
         toolGroup.add(roundRectBtn);
         toolButtons.put(DrawingCanvas.Tool.ROUNDED_RECTANGLE, roundRectBtn);
         bottomBar.add(roundRectBtn);
 
         // Line button
-        JToggleButton lineBtn = new JToggleButton("Line");
+        JToggleButton lineBtn = new JToggleButton("Association");
         lineBtn.addActionListener(e -> canvas.setCurrentTool(DrawingCanvas.Tool.LINE));
         toolGroup.add(lineBtn);
         toolButtons.put(DrawingCanvas.Tool.LINE, lineBtn);
@@ -108,21 +115,28 @@ public class ToolBarShell {
 
         // Arrows
         // Filled arrow
-        JToggleButton arrowFilled = new JToggleButton("Arrow (filled)");
+        JToggleButton arrowFilled = new JToggleButton("Data Flow");
         arrowFilled.addActionListener(e -> canvas.setCurrentTool(DrawingCanvas.Tool.ARROW_FILLED));
         toolGroup.add(arrowFilled);
         toolButtons.put(DrawingCanvas.Tool.ARROW_FILLED, arrowFilled);
         bottomBar.add(arrowFilled);
 
+        // Empty arrow
+        JToggleButton arrowempty = new JToggleButton("Generalisation");
+        arrowempty.addActionListener(e -> canvas.setCurrentTool(DrawingCanvas.Tool.ARROW_EMPTY));
+        toolGroup.add(arrowempty);
+        toolButtons.put(DrawingCanvas.Tool.ARROW_EMPTY, arrowempty);
+        bottomBar.add(arrowempty);
+
         // Diamond arrow
-        JToggleButton arrowDiamond = new JToggleButton("Arrow (diamond)");
+        JToggleButton arrowDiamond = new JToggleButton("Composition");
         arrowDiamond.addActionListener(e -> canvas.setCurrentTool(DrawingCanvas.Tool.ARROW_DIAMOND));
         toolGroup.add(arrowDiamond);
         toolButtons.put(DrawingCanvas.Tool.ARROW_DIAMOND, arrowDiamond);
         bottomBar.add(arrowDiamond);
 
         // Open arrow
-        JToggleButton arrowOpen = new JToggleButton("Arrow (open)");
+        JToggleButton arrowOpen = new JToggleButton("Transition");
         arrowOpen.addActionListener(e -> canvas.setCurrentTool(DrawingCanvas.Tool.ARROW_OPEN));
         toolGroup.add(arrowOpen);
         toolButtons.put(DrawingCanvas.Tool.ARROW_OPEN, arrowOpen);

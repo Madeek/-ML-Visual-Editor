@@ -5,26 +5,17 @@ import com.example.swingapp.model.ReMoDeLEntity;
 import com.example.swingapp.model.ReMoDeLModel;
 import com.example.swingapp.model.Concept;
 
+import java.awt.*;
+import java.util.*;
 import javax.swing.*;
+import java.util.List;
+import java.awt.geom.*;
+import java.awt.event.*;
+import java.util.function.Consumer;
+import java.awt.image.BufferedImage;
 import javax.swing.undo.UndoManager;
 import javax.swing.undo.UndoableEdit;
 import javax.swing.undo.AbstractUndoableEdit;
-
-import java.awt.*;
-import java.awt.event.*;
-import java.awt.font.TextLayout;
-import java.awt.geom.*;
-import java.awt.image.BufferedImage;
-import java.awt.font.FontRenderContext;
-import java.awt.font.TextAttribute;
-import java.text.LineBreakMeasurer;
-import java.text.AttributedCharacterIterator;
-import java.text.AttributedString;
-import java.text.BreakIterator;
-import java.text.CharacterIterator;
-import java.util.*;
-import java.util.function.Consumer;
-import java.util.List;
 
 public class DrawingCanvas extends JComponent {
     private BufferedImage buf;
@@ -88,15 +79,31 @@ public class DrawingCanvas extends JComponent {
         if (model == null) return;
         shapes.clear();
         idToIndex.clear();
+
         java.util.List<ReMoDeLEntity> all = model.getAll();
-        for (int i = 0; i < all.size(); i++) {
-            ReMoDeLEntity e = all.get(i);
+        Map<String, ReMoDeLEntity> entityIndex = new HashMap<>();
+
+        // first pass: shapes (non-connectors) so anchors exist
+        for (ReMoDeLEntity e : all) {
+            if (isConnectorEntity(e)) continue;
             ShapeRecord r = shapeFromEntity(e);
             if (r != null) {
+                idToIndex.put(e.getId(), shapes.size());
                 shapes.add(r);
-                if (r.entityId != null) idToIndex.put(r.entityId, i);
+            }
+            entityIndex.put(e.getId(), e);
+        }
+
+        // second pass: connectors so we can resolve endpoints using stored shapes
+        for (ReMoDeLEntity e : all) {
+            if (!isConnectorEntity(e)) continue;
+            ShapeRecord r = shapeFromConnector(e, entityIndex);
+            if (r != null) {
+                idToIndex.put(e.getId(), shapes.size());
+                shapes.add(r);
             }
         }
+
         redrawBuffer();
         repaint();
     }
@@ -121,14 +128,51 @@ public class DrawingCanvas extends JComponent {
             int h = Math.max(4, y2 - y1);
             return ShapeRecord.textRecord(txt, f, c, strokeWidth, x1, y1, w, h, e.getId());
         }
-        // other types: try to read bbox and draw a rectangle placeholder
+        // non-text shapes: support a shapeType property for round-trip with the model
         Object ox1 = e.get("x1"); Object oy1 = e.get("y1"); Object ox2 = e.get("x2"); Object oy2 = e.get("y2");
         int x1 = ox1 instanceof Number ? ((Number)ox1).intValue() : 10;
         int y1 = oy1 instanceof Number ? ((Number)oy1).intValue() : 10;
         int x2 = ox2 instanceof Number ? ((Number)ox2).intValue() : x1 + 80;
         int y2 = oy2 instanceof Number ? ((Number)oy2).intValue() : y1 + 40;
-        Shape s = new Rectangle2D.Double(Math.min(x1, x2), Math.min(y1, y2), Math.abs(x2 - x1), Math.abs(y2 - y1));
-        return new ShapeRecord(Tool.RECTANGLE, s, Color.BLACK, strokeWidth, x1, y1, x2, y2, null, null, e.getId());
+        // determine tool from stored shapeType (fallback to RECTANGLE)
+        String shapeTypeStr = e.get("shapeType") instanceof String ? (String)e.get("shapeType") : null;
+        Tool t = Tool.RECTANGLE;
+        if (shapeTypeStr != null) {
+            try {
+                t = Tool.valueOf(shapeTypeStr.toUpperCase());
+            } catch (Exception ex) {
+                // ignore and keep default
+            }
+        }
+        // color and stroke (optional)
+        int rgb = e.get("colorRGB") instanceof Number ? ((Number)e.get("colorRGB")).intValue() : Color.BLACK.getRGB();
+        Color col = new Color(rgb, true);
+        float sWidth = e.get("strokeWidth") instanceof Number ? ((Number)e.get("strokeWidth")).floatValue() : strokeWidth;
+
+        int rx = Math.min(x1, x2);
+        int ry = Math.min(y1, y2);
+        int rw = Math.abs(x2 - x1);
+        int rh = Math.abs(y2 - y1);
+        Shape s = null;
+        switch (t) {
+            case LINE:
+            case ARROW_FILLED:
+            case ARROW_DIAMOND:
+            case ARROW_OPEN:
+                s = new Line2D.Double(x1, y1, x2, y2);
+                break;
+            case OVAL:
+                s = new Ellipse2D.Double(rx, ry, rw, rh);
+                break;
+            case ROUNDED_RECTANGLE:
+                s = new RoundRectangle2D.Double(rx, ry, rw, rh, Math.max(8, Math.min(rw, rh) / 4.0), Math.max(8, Math.min(rw, rh) / 4.0));
+                break;
+            case RECTANGLE:
+            default:
+                s = new Rectangle2D.Double(rx, ry, rw, rh);
+                break;
+        }
+        return new ShapeRecord(t, s, col, sWidth, x1, y1, x2, y2, null, null, e.getId());
     }
 
     private ReMoDeLEntity entityFromShape(ShapeRecord r) {
@@ -154,6 +198,10 @@ public class DrawingCanvas extends JComponent {
         ent.put("y1", (int) Math.round(r.y1));
         ent.put("x2", (int) Math.round(r.x2));
         ent.put("y2", (int) Math.round(r.y2));
+        // store the tool/shape type so we can reconstruct the exact visual later
+        if (r.tool != null) ent.put("shapeType", r.tool.name());
+        if (r.color != null) ent.put("colorRGB", r.color.getRGB());
+        ent.put("strokeWidth", r.stroke);
         return ent;
     }
 
@@ -298,15 +346,18 @@ public class DrawingCanvas extends JComponent {
     // tools
     public enum Tool {
         SELECT, DELETE, FREEHAND, LINE,
-        ARROW_FILLED, ARROW_DIAMOND, ARROW_OPEN,
+        ARROW_FILLED, ARROW_EMPTY, ARROW_DIAMOND, ARROW_OPEN,
         OVAL, RECTANGLE, ROUNDED_RECTANGLE,
-        TEXT
+        TEXT, STATE
     }
     private Tool currentTool = Tool.SELECT;
 
     // stored shapes
     private final java.util.List<ShapeRecord> shapes = new ArrayList<>();
     private ShapeRecord preview = null;
+
+    // pending connector creation (first click source, second click target)
+    private PendingConnector pendingConnector = null;
 
     // optional backing model and mapping from entity id -> shape index
     private ReMoDeLModel model = null;
@@ -365,9 +416,27 @@ public class DrawingCanvas extends JComponent {
             return textRecord(text, font, color, stroke, x, y, w, h, null);
         }
 
+        static ShapeRecord stateRecord(String stateName, Font font, Color color, float stroke, double x, double y, double w, double h) {
+        Shape rect = new RoundRectangle2D.Double(x, y, w, h, 400, 400);  // Rounded corners
+        return new ShapeRecord(Tool.STATE, rect, color, stroke, x, y, x + w, y + h, stateName, font, null);
+}
+
         static ShapeRecord textRecord(String text, Font font, Color color, float stroke, double x, double y, double w, double h, String entityId) {
             Shape rect = new Rectangle2D.Double(x, y, w, h);
             return new ShapeRecord(Tool.TEXT, rect, color, stroke, x, y, x + w, y + h, text, font, entityId);
+        }
+    }
+
+    // tracks in-progress connector selection (source)
+    private static class PendingConnector {
+        final Tool tool;
+        final String fromEntityId;
+        final Point2D fromPoint;
+
+        PendingConnector(Tool tool, String fromEntityId, Point2D fromPoint) {
+            this.tool = tool;
+            this.fromEntityId = fromEntityId;
+            this.fromPoint = fromPoint;
         }
     }
 
@@ -658,6 +727,8 @@ public class DrawingCanvas extends JComponent {
         int ry = Math.min(y1, y2);
         int rw = Math.abs(x2 - x1);
         int rh = Math.abs(y2 - y1);
+        String text = null;
+        Font font = null;
 
         switch (t) {
 
@@ -665,21 +736,33 @@ public class DrawingCanvas extends JComponent {
             case ARROW_FILLED:
             case ARROW_DIAMOND:
             case ARROW_OPEN:
+            case ARROW_EMPTY:
                 s = new Line2D.Double(x1, y1, x2, y2);
+                break;
+            case STATE:
+                s = new RoundRectangle2D.Double(rx, ry, rw, rh, 400, 400);
+                text = "State";
+                font = new Font("SansSerif", Font.BOLD, Math.max(12, rh / 3));
                 break;
             case OVAL:
                 s = new Ellipse2D.Double(rx, ry, rw, rh);
+                text = "Task";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case RECTANGLE:
                 s = new Rectangle2D.Double(rx, ry, rw, rh);
+                text = "Object";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case ROUNDED_RECTANGLE:
                 s = new RoundRectangle2D.Double(rx, ry, rw, rh, Math.max(8, Math.min(rw, rh) / 4.0), Math.max(8, Math.min(rw, rh) / 4.0));
+                text = "Process";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             default:
                 s = new Line2D.Double(x1, y1, x2, y2);
         }
-        return new ShapeRecord(t, s, drawColor, strokeWidth, x1, y1, x2, y2);
+        return new ShapeRecord(t, s, drawColor, strokeWidth, x1, y1, x2, y2, text, font);
     }
 
     private ShapeRecord createRecordFromTool(Tool t, Color c, float sWidth, int x1, int y1, int x2, int y2) {
@@ -690,28 +773,43 @@ public class DrawingCanvas extends JComponent {
         int rw = Math.abs(x2 - x1);
         int rh = Math.abs(y2 - y1);
         Shape s = null;
+        String text = null;
+        Font font = null;
+        
         switch (t) {
             case LINE:
             case ARROW_FILLED:
             case ARROW_DIAMOND:
             case ARROW_OPEN:
+            case ARROW_EMPTY:
                 s = new Line2D.Double(x1, y1, x2, y2);
+                break;
+            case STATE:
+                s = new RoundRectangle2D.Double(rx, ry, rw, rh, 400, 400);
+                text = "State";
+                font = new Font("SansSerif", Font.BOLD, Math.max(12, rh / 3));
                 break;
             case OVAL:
                 s = new Ellipse2D.Double(rx, ry, rw, rh);
+                text = "Task";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case RECTANGLE:
                 s = new Rectangle2D.Double(rx, ry, rw, rh);
+                text = "Object";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case ROUNDED_RECTANGLE:
                 s = new RoundRectangle2D.Double(rx, ry, rw, rh, Math.max(8, Math.min(rw, rh) / 4.0), Math.max(8, Math.min(rw, rh) / 4.0));
+                text = "Process";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case FREEHAND:
             default:
                 // fallback to a tiny line
                 s = new Line2D.Double(x1, y1, x2, y2);
         }
-        return new ShapeRecord(t, s, c, sWidth, x1, y1, x2, y2);
+        return new ShapeRecord(t, s, c, sWidth, x1, y1, x2, y2, text, font);
     }
 
     private Graphics2D getBufferGraphics() {
@@ -726,7 +824,7 @@ public class DrawingCanvas extends JComponent {
         double len = Math.hypot(dx, dy);
         if (len < 1e-6) return new Point2D.Double(x2, y2);
         double ux = dx / len, uy = dy / len;
-        double headLen = Math.max(8, 6 + stroke * 2); // match drawArrowHead's headLen
+        double headLen = Math.max(8, 6 + stroke * 2); 
         double bx = x2 - ux * headLen;
         double by = y2 - uy * headLen;
         return new Point2D.Double(bx, by);
@@ -745,11 +843,21 @@ public class DrawingCanvas extends JComponent {
                 break;
             case OVAL:
             case RECTANGLE:
-            case ROUNDED_RECTANGLE:
+            case ROUNDED_RECTANGLE: {
+                // Draw the shape border
                 g.draw(r.shape);
+                // Draw text label if present
+                if (r.text != null) {
+                    Rectangle2D bounds = r.shape.getBounds2D();
+                    Font f = r.font != null ? r.font : new Font("SansSerif", Font.PLAIN, 12);
+                    g.setFont(f);
+                    drawTextLayout(g, r.text, f, bounds, r.color != null ? r.color : g.getColor());
+                }
                 break;
+            }
             case ARROW_FILLED:
             case ARROW_DIAMOND:
+            case ARROW_EMPTY:
             case ARROW_OPEN: {
                 // compute base of arrow head (same logic for all kinds) and draw shaft only to that base
                 Point2D.Double baseAll = computeArrowBase(r.x1, r.y1, r.x2, r.y2, r.stroke);
@@ -757,6 +865,15 @@ public class DrawingCanvas extends JComponent {
                 g.draw(shaftAll);
                 // draw head using the same stroke so geometry matches
                 drawArrowHead(g, r.x1, r.y1, r.x2, r.y2, r.tool);
+                break;
+            } case STATE: {
+                g.draw(r.shape);
+                Rectangle2D bounds = r.shape.getBounds2D();
+                if (r.text != null) {
+                    Font f = r.font != null ? r.font : new Font("SansSerif", Font.BOLD, 12);
+                    g.setFont(f);
+                    drawTextLayout(g, r.text, f, bounds, r.color != null ? r.color : g.getColor());
+                }
                 break;
             }
             case TEXT: {
@@ -833,7 +950,7 @@ public class DrawingCanvas extends JComponent {
         double px = -uy, py = ux; // perp
 
         double headLen = Math.max(8, 6 + strokeWidth * 2);
-        double headWidth = Math.max(6, 4 + strokeWidth * 1.5);
+        double headWidth = Math.max(12, 10 + strokeWidth * 1.5);
 
         // base of head
         double bx = x2 - ux * headLen;
@@ -874,6 +991,14 @@ public class DrawingCanvas extends JComponent {
                 g.draw(new Line2D.Double(x2, y2, sx1, sy1));
                 g.draw(new Line2D.Double(x2, y2, sx2, sy2));
                 break;
+            } case ARROW_EMPTY: {
+                Path2D tri = new Path2D.Double();
+                tri.moveTo(x2, y2);  
+                tri.lineTo(sx1, sy1); 
+                tri.lineTo(sx2, sy2); 
+                tri.closePath();
+                g.draw(tri); 
+                break;
             }
             default:
                 break;
@@ -882,6 +1007,7 @@ public class DrawingCanvas extends JComponent {
 
     /**
      * Draw text with simple word-wrapping inside the given bounds using FontMetrics.
+     * Text is horizontally centered within the bounds.
      * This avoids dependencies on java.text.LineBreakMeasurer/TextLayout so it compiles
      * cleanly in minimal module configurations.
      */
@@ -891,7 +1017,6 @@ public class DrawingCanvas extends JComponent {
         g.setColor(color != null ? color : g.getColor());
         FontMetrics fm = g.getFontMetrics(g.getFont());
         int wrapWidth = Math.max(4, (int) bounds.getWidth() - 8);
-        float x = (float) (bounds.getX() + 4f);
         float y = (float) (bounds.getY() + 4f) + fm.getAscent();
 
         String[] paragraphs = text.split("\r?\n");
@@ -909,8 +1034,11 @@ public class DrawingCanvas extends JComponent {
                 String test = line.length() == 0 ? word : line + " " + word;
                 int w = fm.stringWidth(test);
                 if (w > wrapWidth && line.length() > 0) {
-                    // draw current line
-                    g.drawString(line.toString(), x, y);
+                    // draw current line (centered)
+                    String lineStr = line.toString();
+                    int lineWidth = fm.stringWidth(lineStr);
+                    float x = (float) (bounds.getX() + (bounds.getWidth() - lineWidth) / 2.0);
+                    g.drawString(lineStr, x, y);
                     y += fm.getHeight();
                     if (y > bounds.getY() + bounds.getHeight()) return;
                     line.setLength(0);
@@ -921,7 +1049,11 @@ public class DrawingCanvas extends JComponent {
                 }
             }
             if (line.length() > 0) {
-                g.drawString(line.toString(), x, y);
+                // draw last line (centered)
+                String lineStr = line.toString();
+                int lineWidth = fm.stringWidth(lineStr);
+                float x = (float) (bounds.getX() + (bounds.getWidth() - lineWidth) / 2.0);
+                g.drawString(lineStr, x, y);
                 y += fm.getHeight();
                 if (y > bounds.getY() + bounds.getHeight()) return;
             }
