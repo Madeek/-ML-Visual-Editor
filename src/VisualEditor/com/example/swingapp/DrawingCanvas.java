@@ -3,19 +3,16 @@ package com.example.swingapp;
 
 import com.example.swingapp.model.ReMoDeLEntity;
 import com.example.swingapp.model.ReMoDeLModel;
-import com.example.swingapp.model.Concept;
-
 import java.awt.*;
-import java.util.*;
-import javax.swing.*;
-import java.util.List;
-import java.awt.geom.*;
 import java.awt.event.*;
-import java.util.function.Consumer;
+import java.awt.geom.*;
 import java.awt.image.BufferedImage;
+import java.util.*;
+import java.util.function.Consumer;
+import javax.swing.*;
+import javax.swing.undo.AbstractUndoableEdit;
 import javax.swing.undo.UndoManager;
 import javax.swing.undo.UndoableEdit;
-import javax.swing.undo.AbstractUndoableEdit;
 
 public class DrawingCanvas extends JComponent {
     private BufferedImage buf;
@@ -363,6 +360,11 @@ public class DrawingCanvas extends JComponent {
     private ReMoDeLModel model = null;
     private final java.util.Map<String, Integer> idToIndex = new java.util.HashMap<>();
 
+    // Model getter for external access (e.g., for save/export)
+    public ReMoDeLModel getModel() {
+        return model;
+    }
+
     // selection/edit state
     private int selectedIndex = -1;
     private boolean draggingMove = false;
@@ -417,7 +419,7 @@ public class DrawingCanvas extends JComponent {
         }
 
         static ShapeRecord stateRecord(String stateName, Font font, Color color, float stroke, double x, double y, double w, double h) {
-        Shape rect = new RoundRectangle2D.Double(x, y, w, h, 400, 400);  // Rounded corners
+        Shape rect = s = new RoundRectangle2D.Double(rx, ry, rw, rh, Math.max(20, Math.min(rw, rh) / 4.0), Math.max(20, Math.min(rw, rh) / 4.0));  // Rounded corners
         return new ShapeRecord(Tool.STATE, rect, color, stroke, x, y, x + w, y + h, stateName, font, null);
 }
 
@@ -471,6 +473,7 @@ public class DrawingCanvas extends JComponent {
                 pressX = lastX = e.getX();
                 pressY = lastY = e.getY();
                 statusConsumer.accept("Drawing...");
+
                 if (currentTool == Tool.FREEHAND) {
                     freePath = new GeneralPath();
                     freePath.moveTo(lastX, lastY);
@@ -483,10 +486,20 @@ public class DrawingCanvas extends JComponent {
                     // hit-test shapes from top-most to bottom
                     int hit = hitTest(lastX, lastY);
                     if (hit >= 0) {
-                        // if double-clicked a text item, start inline editing
-                        if (e.getClickCount() == 2 && shapes.get(hit).tool == Tool.TEXT) {
-                            startEditingText(hit);
-                            return;
+                        // if double-clicked, start inline editing
+                        if (e.getClickCount() == 2) {
+                            ShapeRecord sr = shapes.get(hit);
+                            // TEXT items use the existing text editor
+                            if (sr.tool == Tool.TEXT) {
+                                startEditingText(hit);
+                                return;
+                            }
+                            // Shape items (RECTANGLE, OVAL, ROUNDED_RECTANGLE, STATE) get label editing
+                            else if (sr.tool == Tool.RECTANGLE || sr.tool == Tool.OVAL || 
+                                    sr.tool == Tool.ROUNDED_RECTANGLE || sr.tool == Tool.STATE) {
+                                startEditingShapeLabel(hit);
+                                return;
+                            }
                         }
                         selectedIndex = hit;
                         // check if clicked on a handle
@@ -506,7 +519,6 @@ public class DrawingCanvas extends JComponent {
                         selectedIndex = -1;
                         repaint();
                     }
-                    return;
                 }
 
                 // other drawing tools: set preview (but TEXT uses separate placer and shouldn't show preview)
@@ -537,6 +549,7 @@ public class DrawingCanvas extends JComponent {
                     if (selectedIndex >= 0) {
                         ShapeRecord sel = shapes.get(selectedIndex);
                         int dx = x - lastX, dy = y - lastY;
+
                         if (draggingMove) {
                             // translate shape by dx,dy
                             if (sel.tool == Tool.TEXT) {
@@ -552,7 +565,7 @@ public class DrawingCanvas extends JComponent {
                             } else {
                                 Shape moved = AffineTransform.getTranslateInstance(dx, dy).createTransformedShape(sel.shape);
                                 ShapeRecord nr = new ShapeRecord(sel.tool, moved, sel.color, sel.stroke,
-                                        sel.x1 + dx, sel.y1 + dy, sel.x2 + dx, sel.y2 + dy, null, null, sel.entityId);
+                                        sel.x1 + dx, sel.y1 + dy, sel.x2 + dx, sel.y2 + dy, sel.text, sel.font, sel.entityId);
                                 if (sel.entityId != null && model != null) {
                                     model.updateEntity(entityFromShape(nr));
                                 } else {
@@ -684,6 +697,219 @@ public class DrawingCanvas extends JComponent {
         });
     }
 
+    private void startEditingShapeLabel(int index) {
+        if (index < 0 || index >= shapes.size()) return;
+        ShapeRecord sel = shapes.get(index);
+        
+        // Only editable shapes
+        if (sel.tool != Tool.RECTANGLE && sel.tool != Tool.OVAL && 
+            sel.tool != Tool.ROUNDED_RECTANGLE && sel.tool != Tool.STATE) {
+            return;
+        }
+        
+        selectedIndex = index;
+        Rectangle2D b = getShapeBounds(sel);
+        if (b == null) return;
+
+        // Current text (default label based on shape type)
+        String currentText = sel.text != null ? sel.text : getDefaultLabelForTool(sel.tool);
+        
+        final JTextField tf = new JTextField(currentText);
+        tf.setOpaque(true);
+        tf.setBackground(new Color(255, 255, 255));
+        tf.setForeground(sel.color != null ? sel.color : drawColor);
+        tf.setFont(sel.font != null ? sel.font : new Font("SansSerif", Font.PLAIN, 12));
+        tf.setHorizontalAlignment(JTextField.CENTER);
+
+        // Apply shape-specific border styling
+        switch (sel.tool) {
+            case STATE:
+                // Pill shape border (fully rounded ends)
+                int radius = (int) b.getHeight();
+                tf.setBorder(BorderFactory.createCompoundBorder(
+                    new RoundedBorder(radius),
+                    BorderFactory.createEmptyBorder(3, 10, 3, 10) // padding
+                ));
+                break;
+            case OVAL:
+                // Elliptical/oval border
+                tf.setBorder(BorderFactory.createCompoundBorder(
+                    new EllipseBorder(),
+                    BorderFactory.createEmptyBorder(4, 8, 4, 8)
+                ));
+                break;
+            case ROUNDED_RECTANGLE:
+                // Rounded rectangle border
+                tf.setBorder(BorderFactory.createCompoundBorder(
+                    new RoundedBorder(15),
+                    BorderFactory.createEmptyBorder(4, 8, 4, 8)
+                ));
+                break;
+            case RECTANGLE:
+            default:
+                // Standard rectangular border
+                tf.setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(null, 0),
+                    BorderFactory.createEmptyBorder(4, 8, 4, 8)
+                ));
+                break;
+        }
+
+        tf.setBounds((int) b.getX() + 4, (int) b.getY() + 4, 
+                    Math.max(40, (int) b.getWidth() - 8), Math.max(20, (int) b.getHeight() - 8));
+        
+        this.add(tf);
+        this.revalidate();
+        this.repaint();
+        tf.requestFocusInWindow();
+        tf.selectAll();
+
+        Runnable finish = () -> {
+            String newText = tf.getText().trim();
+            if (newText.isEmpty()) newText = getDefaultLabelForTool(sel.tool);
+            DrawingCanvas.this.remove(tf);
+            updateShapeLabel(newText, index);
+            DrawingCanvas.this.revalidate();
+            DrawingCanvas.this.repaint();
+        };
+
+        Runnable cancel = () -> {
+            DrawingCanvas.this.remove(tf);
+            DrawingCanvas.this.revalidate();
+            DrawingCanvas.this.repaint();
+        };
+
+        // Commit on Enter
+        tf.getInputMap(JComponent.WHEN_FOCUSED).put(
+            KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0), "commit");
+        tf.getActionMap().put("commit", new AbstractAction() {
+            @Override public void actionPerformed(ActionEvent e) { finish.run(); }
+        });
+        
+        // Cancel on Escape
+        tf.getInputMap(JComponent.WHEN_FOCUSED).put(
+            KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), "cancel");
+        tf.getActionMap().put("cancel", new AbstractAction() {
+            @Override public void actionPerformed(ActionEvent e) { cancel.run(); }
+        });
+
+        tf.addFocusListener(new FocusAdapter() {
+            @Override public void focusLost(FocusEvent e) {
+                finish.run();
+            }
+        });
+    }
+
+    /**
+     * Custom border that draws a rounded rectangle outline matching STATE shapes.
+     */
+    class RoundedBorder implements javax.swing.border.Border {
+        private final int radius;
+        
+        public RoundedBorder(int radius) {
+            this.radius = radius;
+        }
+        
+        @Override
+        public void paintBorder(Component c, Graphics g, int x, int y, int width, int height) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g2.setColor(new Color(0, 0, 0)); 
+            // g2.setStroke(new BasicStroke(2));
+            // g2.drawRoundRect(x, y, width + 1, height, radius, radius);
+            g2.dispose();
+        }
+        
+        @Override
+        public Insets getBorderInsets(Component c) {
+            return new Insets(2, 2, 2, 2);
+        }
+        
+        @Override
+        public boolean isBorderOpaque() {
+            return false;
+        }
+    }
+
+    /**
+     * Custom border that draws an elliptical outline matching OVAL/Task shapes.
+     */
+    class EllipseBorder implements javax.swing.border.Border {
+        
+        @Override
+        public void paintBorder(Component c, Graphics g, int x, int y, int width, int height) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g2.setColor(new Color(100, 150, 255)); // Blue outline
+            // g2.setStroke(new BasicStroke(2));
+            // g2.drawOval(x, y, width - 1, height - 1);
+            g2.dispose();
+        }
+        
+        @Override
+        public Insets getBorderInsets(Component c) {
+            return new Insets(2, 2, 2, 2);
+        }
+        
+        @Override
+        public boolean isBorderOpaque() {
+            return false;
+        }
+    }
+
+    /**
+     * Get the default label text for a given tool type.
+     */
+    private String getDefaultLabelForTool(Tool tool) {
+        switch (tool) {
+            case RECTANGLE: return "Object";
+            case OVAL: return "Task";
+            case ROUNDED_RECTANGLE: return "Process";
+            case STATE: return "State";
+            case LINE: return "Association";
+            case ARROW_FILLED: return "Data Flow";
+            case ARROW_EMPTY: return "Generalisation";
+            case ARROW_DIAMOND: return "Composition";
+            case ARROW_OPEN: return "Transition";
+            default: return "Label";
+        }
+    }
+
+    /**
+     * Update the label text for a shape at the given index.
+     */
+    private void updateShapeLabel(String newText, int index) {
+        if (index < 0 || index >= shapes.size()) return;
+        ShapeRecord sel = shapes.get(index);
+        
+        // Create updated record with new text
+        ShapeRecord nr = new ShapeRecord(
+            sel.tool, 
+            sel.shape, 
+            sel.color, 
+            sel.stroke,
+            sel.x1, sel.y1, sel.x2, sel.y2,
+            newText,  // NEW TEXT
+            sel.font,
+            sel.entityId
+        );
+        
+        // Register undo
+        ShapeRecord before = copyShapeRecord(sel);
+        ShapeRecord after = copyShapeRecord(nr);
+        
+        // Update shape (via model if backed by one)
+        if (sel.entityId != null && model != null) {
+            model.updateEntity(entityFromShape(after));
+        } else {
+            shapes.set(index, nr);
+            redrawBuffer();
+            repaint();
+        }
+        
+        addUndoableEdit(new TextEdit(index, before, after));
+    }
+
     private int hitTest(int x, int y) {
 
         Point2D p = new Point2D.Double(x, y);
@@ -740,9 +966,9 @@ public class DrawingCanvas extends JComponent {
                 s = new Line2D.Double(x1, y1, x2, y2);
                 break;
             case STATE:
-                s = new RoundRectangle2D.Double(rx, ry, rw, rh, 400, 400);
+                s = new RoundRectangle2D.Double(rx, ry, rw, rh, rh, rh);
                 text = "State";
-                font = new Font("SansSerif", Font.BOLD, Math.max(12, rh / 3));
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case OVAL:
                 s = new Ellipse2D.Double(rx, ry, rw, rh);
@@ -778,16 +1004,30 @@ public class DrawingCanvas extends JComponent {
         
         switch (t) {
             case LINE:
+                text = "Association";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
             case ARROW_FILLED:
+                text = "Data Flow";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
             case ARROW_DIAMOND:
+                text = "Composition";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
             case ARROW_OPEN:
+                text = "Transition";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
             case ARROW_EMPTY:
                 s = new Line2D.Double(x1, y1, x2, y2);
+                text = "Generalisation";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case STATE:
-                s = new RoundRectangle2D.Double(rx, ry, rw, rh, 400, 400);
+                s = new RoundRectangle2D.Double(rx, ry, rw, rh, rh, rh);
                 text = "State";
-                font = new Font("SansSerif", Font.BOLD, Math.max(12, rh / 3));
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case OVAL:
                 s = new Ellipse2D.Double(rx, ry, rw, rh);
@@ -870,7 +1110,7 @@ public class DrawingCanvas extends JComponent {
                 g.draw(r.shape);
                 Rectangle2D bounds = r.shape.getBounds2D();
                 if (r.text != null) {
-                    Font f = r.font != null ? r.font : new Font("SansSerif", Font.BOLD, 12);
+                    Font f = r.font != null ? r.font : new Font("SansSerif", Font.PLAIN, 12);
                     g.setFont(f);
                     drawTextLayout(g, r.text, f, bounds, r.color != null ? r.color : g.getColor());
                 }
@@ -904,6 +1144,7 @@ public class DrawingCanvas extends JComponent {
         ensureBuffer();
         Graphics2D g = (Graphics2D) gg.create();
         g.drawImage(buf, 0, 0, this);
+
         // draw preview on top
         if (preview != null) {
             g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
@@ -913,21 +1154,24 @@ public class DrawingCanvas extends JComponent {
             drawRecord(g, preview, true);
             g.setComposite(prevComp);
         }
+
         // draw selection handles
         if (selectedIndex >= 0 && selectedIndex < shapes.size()) {
             ShapeRecord sel = shapes.get(selectedIndex);
+
+            g.setColor(Color.BLUE);
+            g.setStroke(new BasicStroke(1f));
+            g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g.draw(sel.shape);
+
             Rectangle2D b = getShapeBounds(sel);
             if (b != null) {
-                g.setColor(Color.BLUE);
-                g.setStroke(new BasicStroke(1f));
-                g.draw(b);
-                // handles
                 double hx = b.getX(), hy = b.getY(), hw = b.getWidth(), hh = b.getHeight();
                 Rectangle2D[] handles = new Rectangle2D[] {
-                        new Rectangle2D.Double(hx - HANDLE_SIZE/2, hy - HANDLE_SIZE/2, HANDLE_SIZE, HANDLE_SIZE), // tl
-                        new Rectangle2D.Double(hx + hw - HANDLE_SIZE/2, hy - HANDLE_SIZE/2, HANDLE_SIZE, HANDLE_SIZE), // tr
-                        new Rectangle2D.Double(hx + hw - HANDLE_SIZE/2, hy + hh - HANDLE_SIZE/2, HANDLE_SIZE, HANDLE_SIZE), // br
-                        new Rectangle2D.Double(hx - HANDLE_SIZE/2, hy + hh - HANDLE_SIZE/2, HANDLE_SIZE, HANDLE_SIZE) // bl
+                    new Rectangle2D.Double(hx - HANDLE_SIZE/2, hy - HANDLE_SIZE/2, HANDLE_SIZE, HANDLE_SIZE), // tl
+                    new Rectangle2D.Double(hx + hw - HANDLE_SIZE/2, hy - HANDLE_SIZE/2, HANDLE_SIZE, HANDLE_SIZE), // tr
+                    new Rectangle2D.Double(hx + hw - HANDLE_SIZE/2, hy + hh - HANDLE_SIZE/2, HANDLE_SIZE, HANDLE_SIZE), // br
+                    new Rectangle2D.Double(hx - HANDLE_SIZE/2, hy + hh - HANDLE_SIZE/2, HANDLE_SIZE, HANDLE_SIZE) // bl
                 };
                 g.setColor(Color.WHITE);
                 for (Rectangle2D h : handles) {
