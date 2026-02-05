@@ -235,9 +235,24 @@ public class ToolBarShell {
         JMenuItem openItem = new JMenuItem("Open...");
         openItem.addActionListener(e -> {
             JFileChooser chooser = new JFileChooser();
+            chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("XML files (*.xml)", "xml"));
+            chooser.addChoosableFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("JSON files (*.json)", "json"));
             int res = chooser.showOpenDialog(parentFrame);
             if (res == JFileChooser.APPROVE_OPTION) {
-                // TODO: load file into canvas / model
+                String filePath = chooser.getSelectedFile().getAbsolutePath();
+                try {
+                    com.example.swingapp.model.ReMoDeLModel model = new com.example.swingapp.model.ReMoDeLModel();
+                    if (filePath.endsWith(".json")) {
+                        ReMoDeLImporter.importFromJSON(filePath, model);
+                    } else {
+                        ReMoDeLImporter.importFromXML(filePath, model);
+                    }
+                    // Set the model on the canvas (this will trigger rebuild from entities)
+                    canvas.setModel(model);
+                    JOptionPane.showMessageDialog(parentFrame, "Model loaded successfully", "Success", JOptionPane.INFORMATION_MESSAGE);
+                } catch (Exception ex) {
+                    JOptionPane.showMessageDialog(parentFrame, "Error loading: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+                }
             }
         });
         fileMenu.add(openItem);
@@ -245,9 +260,26 @@ public class ToolBarShell {
         JMenuItem saveItem = new JMenuItem("Save...");
         saveItem.addActionListener(e -> {
             JFileChooser chooser = new JFileChooser();
+            chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("XML files (*.xml)", "xml"));
+            chooser.addChoosableFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("JSON files (*.json)", "json"));
             int res = chooser.showSaveDialog(parentFrame);
             if (res == JFileChooser.APPROVE_OPTION) {
-                // TODO: save model/canvas to disk
+                String filePath = chooser.getSelectedFile().getAbsolutePath();
+                try {
+                    com.example.swingapp.model.ReMoDeLModel model = canvas.getModel();
+                    if (model == null) {
+                        JOptionPane.showMessageDialog(parentFrame, "No model to save", "Error", JOptionPane.ERROR_MESSAGE);
+                        return;
+                    }
+                    if (filePath.endsWith(".json")) {
+                        com.example.swingapp.model.ReMoDeLExporter.exportToJSON(model, filePath);
+                    } else {
+                        com.example.swingapp.model.ReMoDeLExporter.exportToXML(model, filePath);
+                    }
+                    JOptionPane.showMessageDialog(parentFrame, "Model saved successfully", "Success", JOptionPane.INFORMATION_MESSAGE);
+                } catch (Exception ex) {
+                    JOptionPane.showMessageDialog(parentFrame, "Error saving: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+                }
             }
         });
         fileMenu.add(saveItem);
