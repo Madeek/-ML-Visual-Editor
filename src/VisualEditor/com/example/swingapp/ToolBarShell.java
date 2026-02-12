@@ -10,6 +10,7 @@ import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.event.FocusAdapter;
 import java.awt.event.FocusEvent;
+import java.io.File;
 import java.util.HashMap;
 import java.util.Map;
 import java.beans.PropertyChangeEvent;
@@ -257,6 +258,23 @@ public class ToolBarShell {
         });
         fileMenu.add(openItem);
 
+        JMenuItem openDrawingItem = new JMenuItem("Open Drawing (Binary)...");
+        openDrawingItem.addActionListener(e -> {
+            JFileChooser chooser = new JFileChooser();
+            chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("Drawing files (*.ser)", "ser"));
+            int res = chooser.showOpenDialog(parentFrame);
+            if (res == JFileChooser.APPROVE_OPTION) {
+                File file = chooser.getSelectedFile();
+                try {
+                    canvas.loadDrawing(file);
+                    JOptionPane.showMessageDialog(parentFrame, "Drawing loaded successfully", "Success", JOptionPane.INFORMATION_MESSAGE);
+                } catch (Exception ex) {
+                    JOptionPane.showMessageDialog(parentFrame, "Error loading drawing: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+                }
+            }
+        });
+        fileMenu.add(openDrawingItem);
+
         JMenuItem saveItem = new JMenuItem("Save...");
         saveItem.addActionListener(e -> {
             JFileChooser chooser = new JFileChooser();
@@ -283,6 +301,26 @@ public class ToolBarShell {
             }
         });
         fileMenu.add(saveItem);
+
+        JMenuItem saveDrawingItem = new JMenuItem("Save Drawing (Binary)...");
+        saveDrawingItem.addActionListener(e -> {
+            JFileChooser chooser = new JFileChooser();
+            chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("Drawing files (*.ser)", "ser"));
+            int res = chooser.showSaveDialog(parentFrame);
+            if (res == JFileChooser.APPROVE_OPTION) {
+                File file = chooser.getSelectedFile();
+                if (!file.getName().toLowerCase().endsWith(".ser")) {
+                    file = new File(file.getParentFile(), file.getName() + ".ser");
+                }
+                try {
+                    canvas.saveDrawing(file);
+                    JOptionPane.showMessageDialog(parentFrame, "Drawing saved successfully", "Success", JOptionPane.INFORMATION_MESSAGE);
+                } catch (Exception ex) {
+                    JOptionPane.showMessageDialog(parentFrame, "Error saving drawing: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+                }
+            }
+        });
+        fileMenu.add(saveDrawingItem);
 
         fileMenu.addSeparator();
 
