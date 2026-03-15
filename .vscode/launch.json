@@ -6,6 +6,20 @@
     "configurations": [
         {
             "type": "java",
+            "name": "Main",
+            "request": "launch",
+            "mainClass": "VisualEditor/com.example.swingapp.app.Main",
+            "projectName": "VisualEditor_80dc0a36"
+        },
+        {
+            "type": "java",
+            "name": "Main",
+            "request": "launch",
+            "mainClass": "VisualEditor/com.example.swingapp.Main",
+            "projectName": "VisualEditor_80dc0a36"
+        },
+        {
+            "type": "java",
             "name": "MainFrame",
             "request": "launch",
             "mainClass": "VisualEditor/com.example.swingapp.MainFrame",

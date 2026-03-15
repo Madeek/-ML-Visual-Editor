@@ -56,6 +56,10 @@ public class ReMoDeLEntity implements Serializable {
         properties.put(key, value);
     }
 
+    public void setProperty(String key, Object value) {
+        properties.put(key, value);
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) return true;

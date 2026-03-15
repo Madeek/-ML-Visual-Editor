@@ -1,0 +1,3209 @@
+// This class implements a drawing canvas with basic shape tools, selection, and editing.
+package com.example.swingapp.view;
+
+import com.example.swingapp.model.ModelEvent;
+import com.example.swingapp.model.ModelListener;
+import com.example.swingapp.model.ReMoDeLEntity;
+import com.example.swingapp.model.ReMoDeLModel;
+import java.awt.*;
+import java.awt.event.*;
+import java.awt.geom.*;
+import java.awt.image.BufferedImage;
+import java.io.*;
+import java.util.*;
+import java.util.function.Consumer;
+import javax.swing.*;
+import javax.swing.undo.AbstractUndoableEdit;
+import javax.swing.undo.UndoManager;
+import javax.swing.undo.UndoableEdit;
+
+public class DrawingCanvas extends JComponent {
+    private BufferedImage buf;
+    private Color drawColor = Color.BLACK;
+    private float strokeWidth = 3f;
+    private String referenceDefaultName = "member";
+    private String referenceQualifier = "";
+    private int lastX = -1, lastY = -1;
+    private Consumer<String> statusConsumer = s -> {};
+    private final UndoManager undoManager = new UndoManager();
+    // currently active move/resize undoable edit (grouped per drag)
+    private MoveEdit currentMoveEdit = null;
+
+    // helper to create a defensive copy of a ShapeRecord (reconstruct shapes from numeric coords)
+    private ShapeRecord copyShapeRecord(ShapeRecord r) {
+        if (r == null) return null;
+        if (r.tool == Tool.TEXT) {
+            double x = r.x1, y = r.y1, w = r.x2 - r.x1, h = r.y2 - r.y1;
+            Shape rect = new Rectangle2D.Double(x, y, w, h);
+            return new ShapeRecord(Tool.TEXT, rect, r.color, r.stroke, r.x1, r.y1, r.x2, r.y2, r.text, r.font,
+                    r.entityId, r.localId, r.anchorFromId, r.anchorToId);
+        } else {
+            // use existing factory to rebuild shape from coords
+            ShapeRecord nr = createRecordFromTool(r.tool, r.color, r.stroke, (int) Math.round(r.x1), (int) Math.round(r.y1), (int) Math.round(r.x2), (int) Math.round(r.y2));
+            if (nr != null) {
+                return new ShapeRecord(nr.tool, nr.shape, nr.color, nr.stroke, nr.x1, nr.y1, nr.x2, nr.y2,
+                        r.text, r.font, r.entityId, r.localId, r.anchorFromId, r.anchorToId);
+            }
+            return r;
+        }
+    }
+
+    // --- Model wiring -----------------------------------------------------------------
+    private ModelListener modelListener = null;
+
+    public void setModel(ReMoDeLModel m) {
+        if (this.model != null && modelListener != null) {
+            this.model.removeListener(modelListener);
+        }
+        this.model = m;
+        idToIndex.clear();
+        shapes.clear();
+        if (m == null) {
+            redrawBuffer();
+            repaint();
+            return;
+        }
+        // build initial shapes from model
+        rebuildShapesFromModel();
+
+        // register listener to keep canvas in sync
+        modelListener = new ModelListener() {
+            @Override
+            public void modelChanged(ModelEvent e) {
+                // Ensure UI updates happen on EDT
+                SwingUtilities.invokeLater(() -> {
+                    rebuildShapesFromModel();
+                });
+            }
+        };
+        m.addListener(modelListener);
+    }
+
+    private void rebuildShapesFromModel() {
+        if (model == null) return;
+        shapes.clear();
+        idToIndex.clear();
+
+        java.util.List<ReMoDeLEntity> all = model.getAll();
+        Map<String, ReMoDeLEntity> entityIndex = new HashMap<>();
+
+        // first pass: shapes (non-connectors) so anchors exist
+        for (ReMoDeLEntity e : all) {
+            if (isConnectorEntity(e)) continue;
+            ShapeRecord r = shapeFromEntity(e);
+            if (r != null) {
+                idToIndex.put(e.getId(), shapes.size());
+                shapes.add(r);
+            }
+            entityIndex.put(e.getId(), e);
+        }
+
+        // second pass: connectors so we can resolve endpoints using stored shapes
+        for (ReMoDeLEntity e : all) {
+            if (!isConnectorEntity(e)) continue;
+            ShapeRecord r = shapeFromConnector(e, entityIndex);
+            if (r != null) {
+                idToIndex.put(e.getId(), shapes.size());
+                shapes.add(r);
+            }
+        }
+
+        redrawBuffer();
+        repaint();
+    }
+
+    private boolean isConnectorEntity(ReMoDeLEntity e) {
+        return e != null && "connector".equalsIgnoreCase(e.getType());
+    }
+
+    private boolean isConnectorTool(Tool t) {
+        return t == Tool.LINE || t == Tool.AUTHORISATION || t == Tool.ARROW_FILLED || t == Tool.ARROW_EMPTY
+            || t == Tool.INITIAL_TRANSITION || t == Tool.FINAL_TRANSITION
+            || t == Tool.ARROW_DIAMOND || t == Tool.ARROW_OPEN || t == Tool.IMPACT
+            || t == Tool.REFERENCE || t == Tool.ENACTS;
+    }
+
+    private String getConnectorLabel(Tool tool, String existingText) {
+        if (!isConnectorTool(tool)) return existingText;
+        if (existingText != null && !existingText.isBlank()) return existingText;
+        return getDefaultLabelForTool(tool);
+    }
+
+    private int findAnchorTarget(int x, int y) {
+        Point2D p = new Point2D.Double(x, y);
+        for (int i = shapes.size() - 1; i >= 0; i--) {
+            ShapeRecord r = shapes.get(i);
+            if (r == null || isConnectorTool(r.tool)) continue;
+            try {
+                if (r.shape.contains(p)) return i;
+            } catch (Exception ignored) {
+            }
+            Shape pick = new BasicStroke(Math.max(6f, r.stroke + 6f)).createStrokedShape(r.shape);
+            if (pick.contains(p)) return i;
+        }
+        return -1;
+    }
+
+    private ShapeRecord findShapeByLocalId(String localId) {
+        if (localId == null) return null;
+        for (ShapeRecord r : shapes) {
+            if (r != null && localId.equals(r.localId)) return r;
+        }
+        return null;
+    }
+
+    private String findEntityIdByLocalId(String localId) {
+        ShapeRecord r = findShapeByLocalId(localId);
+        return r != null ? r.entityId : null;
+    }
+
+    private void reanchorConnectorsFor(String localId) {
+        if (localId == null) return;
+        for (int i = 0; i < shapes.size(); i++) {
+            ShapeRecord r = shapes.get(i);
+            if (r == null || !isConnectorTool(r.tool)) continue;
+            if (isManualConnector(r)) continue;
+            if (!localId.equals(r.anchorFromId) && !localId.equals(r.anchorToId)) continue;
+            ShapeRecord from = findShapeByLocalId(r.anchorFromId);
+            ShapeRecord to = findShapeByLocalId(r.anchorToId);
+            if (from == null || to == null) continue;
+            Point2D.Double[] anchors = computeConnectorAnchors(from, to);
+            Point2D.Double start = anchors[0];
+            Point2D.Double end = anchors[1];
+            Shape line = new Line2D.Double(start.x, start.y, end.x, end.y);
+            ShapeRecord updated = new ShapeRecord(r.tool, line, r.color, r.stroke, start.x, start.y, end.x, end.y,
+                    r.text, r.font, r.entityId, r.localId, r.anchorFromId, r.anchorToId);
+            shapes.set(i, updated);
+        }
+        redrawBuffer();
+        repaint();
+    }
+
+    private boolean isManualConnector(ReMoDeLEntity e) {
+        if (e == null) return false;
+        Object v = e.get("manualPosition");
+        if (v instanceof Boolean) return (Boolean) v;
+        if (v instanceof String) return Boolean.parseBoolean((String) v);
+        return false;
+    }
+
+    private boolean isManualConnector(ShapeRecord r) {
+        return r != null && (r.anchorFromId == null || r.anchorToId == null);
+    }
+
+    private ShapeRecord shapeFromConnector(ReMoDeLEntity connector, Map<String, ReMoDeLEntity> entityIndex) {
+        if (connector == null) return null;
+        if (isManualConnector(connector)) {
+            int x1 = connector.get("x1") instanceof Number ? ((Number) connector.get("x1")).intValue() : 0;
+            int y1 = connector.get("y1") instanceof Number ? ((Number) connector.get("y1")).intValue() : 0;
+            int x2 = connector.get("x2") instanceof Number ? ((Number) connector.get("x2")).intValue() : x1 + 40;
+            int y2 = connector.get("y2") instanceof Number ? ((Number) connector.get("y2")).intValue() : y1 + 40;
+
+            String typeStr = null;
+            Object typeObj = connector.get("shapeType");
+            if (typeObj == null) typeObj = connector.get("type");
+            if (typeObj != null) typeStr = typeObj.toString();
+
+            Tool tool = Tool.ARROW_OPEN;
+            if (typeStr != null && !typeStr.isBlank()) {
+                try {
+                    tool = Tool.valueOf(typeStr.trim().toUpperCase());
+                } catch (Exception ignored) {
+                }
+            }
+
+            int rgb = connector.get("colorRGB") instanceof Number ? ((Number) connector.get("colorRGB")).intValue() : Color.BLACK.getRGB();
+            Color c = new Color(rgb, true);
+            float sWidth = connector.get("strokeWidth") instanceof Number ? ((Number) connector.get("strokeWidth")).floatValue() : strokeWidth;
+            String text = connector.get("text") instanceof String ? (String) connector.get("text") : null;
+            text = getConnectorLabel(tool, text);
+
+            Shape line = new Line2D.Double(x1, y1, x2, y2);
+            return new ShapeRecord(tool, line, c, sWidth, x1, y1, x2, y2, text, null,
+                connector.getId(), connector.getId(), null, null);
+        }
+
+        Object fromObj = connector.get("fromId");
+        Object toObj = connector.get("toId");
+        if (fromObj == null || toObj == null) {
+            fromObj = connector.get("from");
+            toObj = connector.get("to");
+        }
+        if (fromObj == null || toObj == null) return null;
+        String fromId = fromObj.toString();
+        String toId = toObj.toString();
+
+        ReMoDeLEntity fromEntity = entityIndex.get(fromId);
+        ReMoDeLEntity toEntity = entityIndex.get(toId);
+        if (fromEntity == null || toEntity == null) return null;
+
+        ShapeRecord fromShape = shapeFromEntity(fromEntity);
+        ShapeRecord toShape = shapeFromEntity(toEntity);
+        if (fromShape == null || toShape == null) return null;
+
+        String typeStr = null;
+        Object typeObj = connector.get("shapeType");
+        if (typeObj == null) typeObj = connector.get("type");
+        if (typeObj != null) typeStr = typeObj.toString();
+
+        Tool tool = Tool.ARROW_OPEN;
+        if (typeStr != null && !typeStr.isBlank()) {
+            try {
+                tool = Tool.valueOf(typeStr.trim().toUpperCase());
+            } catch (Exception ignored) {
+            }
+        }
+
+        Point2D.Double[] anchors = computeConnectorAnchors(fromShape, toShape);
+        Point2D.Double start = anchors[0];
+        Point2D.Double end = anchors[1];
+
+        int rgb = connector.get("colorRGB") instanceof Number ? ((Number) connector.get("colorRGB")).intValue() : Color.BLACK.getRGB();
+        Color c = new Color(rgb, true);
+        float sWidth = connector.get("strokeWidth") instanceof Number ? ((Number) connector.get("strokeWidth")).floatValue() : strokeWidth;
+
+        String text = connector.get("text") instanceof String ? (String) connector.get("text") : null;
+        text = getConnectorLabel(tool, text);
+        Shape line = new Line2D.Double(start.x, start.y, end.x, end.y);
+        return new ShapeRecord(tool, line, c, sWidth, start.x, start.y, end.x, end.y, text, null,
+            connector.getId(), connector.getId(), fromShape.localId, toShape.localId);
+    }
+
+    private Point2D.Double[] computeConnectorAnchors(ShapeRecord fromShape, ShapeRecord toShape) {
+        Point2D.Double fromCenter = getShapeCenter(fromShape);
+        Point2D.Double toCenter = getShapeCenter(toShape);
+
+        Point2D.Double start = intersectShapeBoundary(fromShape, fromCenter, toCenter);
+        Point2D.Double end = intersectShapeBoundary(toShape, toCenter, fromCenter);
+
+        if (start == null) start = fromCenter;
+        if (end == null) end = toCenter;
+        return new Point2D.Double[] { start, end };
+    }
+
+    private Point2D.Double getShapeCenter(ShapeRecord r) {
+        Rectangle2D b = r.shape.getBounds2D();
+        return new Point2D.Double(b.getCenterX(), b.getCenterY());
+    }
+
+    private Point2D.Double intersectShapeBoundary(ShapeRecord r, Point2D.Double from, Point2D.Double to) {
+        if (r == null || r.shape == null || from == null || to == null) return null;
+        Rectangle2D b = r.shape.getBounds2D();
+        if (b.getWidth() <= 0 || b.getHeight() <= 0) return null;
+
+        double dx = to.x - from.x;
+        double dy = to.y - from.y;
+        if (Math.abs(dx) < 1e-6 && Math.abs(dy) < 1e-6) return new Point2D.Double(from.x, from.y);
+
+        if (r.tool == Tool.OVAL) {
+            double rx = b.getWidth() / 2.0;
+            double ry = b.getHeight() / 2.0;
+            if (rx <= 0 || ry <= 0) return new Point2D.Double(from.x, from.y);
+            double t = 1.0 / Math.sqrt((dx * dx) / (rx * rx) + (dy * dy) / (ry * ry));
+            return new Point2D.Double(from.x + dx * t, from.y + dy * t);
+        }
+
+        // default: rectangle/rounded/state/text bounds intersection
+        double minX = b.getMinX();
+        double maxX = b.getMaxX();
+        double minY = b.getMinY();
+        double maxY = b.getMaxY();
+
+        Point2D.Double best = null;
+        double bestT = Double.POSITIVE_INFINITY;
+
+        if (Math.abs(dx) > 1e-6) {
+            double t1 = (minX - from.x) / dx;
+            double y1 = from.y + t1 * dy;
+            if (t1 > 0 && y1 >= minY && y1 <= maxY && t1 < bestT) {
+                bestT = t1;
+                best = new Point2D.Double(minX, y1);
+            }
+            double t2 = (maxX - from.x) / dx;
+            double y2 = from.y + t2 * dy;
+            if (t2 > 0 && y2 >= minY && y2 <= maxY && t2 < bestT) {
+                bestT = t2;
+                best = new Point2D.Double(maxX, y2);
+            }
+        }
+
+        if (Math.abs(dy) > 1e-6) {
+            double t3 = (minY - from.y) / dy;
+            double x3 = from.x + t3 * dx;
+            if (t3 > 0 && x3 >= minX && x3 <= maxX && t3 < bestT) {
+                bestT = t3;
+                best = new Point2D.Double(x3, minY);
+            }
+            double t4 = (maxY - from.y) / dy;
+            double x4 = from.x + t4 * dx;
+            if (t4 > 0 && x4 >= minX && x4 <= maxX && t4 < bestT) {
+                bestT = t4;
+                best = new Point2D.Double(x4, maxY);
+            }
+        }
+
+        return best;
+    }
+
+    private ShapeRecord shapeFromEntity(ReMoDeLEntity e) {
+        if (e == null) return null;
+        String type = e.getType();
+        if ("text".equalsIgnoreCase(type)) {
+            Object ox1 = e.get("x1"); Object oy1 = e.get("y1"); Object ox2 = e.get("x2"); Object oy2 = e.get("y2");
+            int x1 = ox1 instanceof Number ? ((Number)ox1).intValue() : 0;
+            int y1 = oy1 instanceof Number ? ((Number)oy1).intValue() : 0;
+            int x2 = ox2 instanceof Number ? ((Number)ox2).intValue() : x1 + 80;
+            int y2 = oy2 instanceof Number ? ((Number)oy2).intValue() : y1 + 30;
+            String txt = e.get("text") instanceof String ? (String)e.get("text") : "";
+            String fontName = e.get("fontName") instanceof String ? (String)e.get("fontName") : "SansSerif";
+            int fontStyle = e.get("fontStyle") instanceof Number ? ((Number)e.get("fontStyle")).intValue() : Font.PLAIN;
+            int fontSize = e.get("fontSize") instanceof Number ? ((Number)e.get("fontSize")).intValue() : Math.max(12, (y2 - y1) / 2);
+            int rgb = e.get("colorRGB") instanceof Number ? ((Number)e.get("colorRGB")).intValue() : Color.BLACK.getRGB();
+            Font f = new Font(fontName, fontStyle, fontSize);
+            Color c = new Color(rgb, true);
+            int w = Math.max(4, x2 - x1);
+            int h = Math.max(4, y2 - y1);
+            return ShapeRecord.textRecord(txt, f, c, strokeWidth, x1, y1, w, h, e.getId());
+        }
+        // non-text shapes: support a shapeType property for round-trip with the model
+        Object ox1 = e.get("x1"); Object oy1 = e.get("y1"); Object ox2 = e.get("x2"); Object oy2 = e.get("y2");
+        int x1 = ox1 instanceof Number ? ((Number)ox1).intValue() : 10;
+        int y1 = oy1 instanceof Number ? ((Number)oy1).intValue() : 10;
+        int x2 = ox2 instanceof Number ? ((Number)ox2).intValue() : x1 + 80;
+        int y2 = oy2 instanceof Number ? ((Number)oy2).intValue() : y1 + 40;
+        // determine tool from stored shapeType (fallback to RECTANGLE)
+        String shapeTypeStr = e.get("shapeType") instanceof String ? (String)e.get("shapeType") : null;
+        Tool t = Tool.RECTANGLE;
+        if (shapeTypeStr != null) {
+            try {
+                t = Tool.valueOf(shapeTypeStr.toUpperCase());
+            } catch (Exception ex) {
+                // ignore and keep default
+            }
+        }
+        // color and stroke (optional)
+        int rgb = e.get("colorRGB") instanceof Number ? ((Number)e.get("colorRGB")).intValue() : Color.BLACK.getRGB();
+        Color col = new Color(rgb, true);
+        float sWidth = e.get("strokeWidth") instanceof Number ? ((Number)e.get("strokeWidth")).floatValue() : strokeWidth;
+
+        int rx = Math.min(x1, x2);
+        int ry = Math.min(y1, y2);
+        int rw = Math.abs(x2 - x1);
+        int rh = Math.abs(y2 - y1);
+        Shape s = null;
+        String txt = e.get("text") instanceof String ? (String) e.get("text") : null;
+        switch (t) {
+            case LINE:
+            case ARROW_FILLED:
+            case ARROW_DIAMOND:
+            case ARROW_OPEN:
+            case IMPACT:
+            case REFERENCE:
+                s = new Line2D.Double(x1, y1, x2, y2);
+                break;
+            case OVAL:
+                s = new Ellipse2D.Double(rx, ry, rw, rh);
+                break;
+            case ROUNDED_RECTANGLE:
+                s = new RoundRectangle2D.Double(rx, ry, rw, rh, Math.max(8, Math.min(rw, rh) / 4.0), Math.max(8, Math.min(rw, rh) / 4.0));
+                break;
+            case ACTOR:
+                s = buildActorShape(rx, ry, rw, rh);
+                break;
+            case RECTANGLE:
+            case OBJECT_TYPE:
+            default:
+                s = new Rectangle2D.Double(rx, ry, rw, rh);
+                break;
+        }
+        return new ShapeRecord(t, s, col, sWidth, x1, y1, x2, y2, txt, null, e.getId());
+    }
+
+    private ReMoDeLEntity entityFromShape(ShapeRecord r) {
+        if (r == null) return null;
+        ReMoDeLEntity ent = new ReMoDeLEntity(r.entityId);
+        if (r.tool == Tool.TEXT) {
+            ent.setType("text");
+            ent.put("x1", (int) Math.round(r.x1));
+            ent.put("y1", (int) Math.round(r.y1));
+            ent.put("x2", (int) Math.round(r.x2));
+            ent.put("y2", (int) Math.round(r.y2));
+            ent.put("text", r.text != null ? r.text : "");
+            if (r.font != null) {
+                ent.put("fontName", r.font.getName());
+                ent.put("fontStyle", r.font.getStyle());
+                ent.put("fontSize", r.font.getSize());
+            }
+            if (r.color != null) ent.put("colorRGB", r.color.getRGB());
+            return ent;
+        }
+        ent.setType("shape");
+        ent.put("x1", (int) Math.round(r.x1));
+        ent.put("y1", (int) Math.round(r.y1));
+        ent.put("x2", (int) Math.round(r.x2));
+        ent.put("y2", (int) Math.round(r.y2));
+        // store the tool/shape type so we can reconstruct the exact visual later
+        if (r.tool != null) ent.put("shapeType", r.tool.name());
+        if (r.color != null) ent.put("colorRGB", r.color.getRGB());
+        if (r.text != null) ent.put("text", r.text);
+        ent.put("strokeWidth", r.stroke);
+        return ent;
+    }
+
+    // Undoable edit for moving/resizing a shape (stores before/after ShapeRecord)
+    private class MoveEdit extends AbstractUndoableEdit {
+        private final int index;
+        private final ShapeRecord before;
+        private ShapeRecord after;
+
+        MoveEdit(int index, ShapeRecord before) {
+            this.index = index;
+            this.before = before;
+        }
+
+        void setAfter(ShapeRecord after) {
+            this.after = after;
+        }
+
+        @Override
+        public void undo() {
+            super.undo();
+            if (index >= 0 && index < shapes.size()) {
+                shapes.set(index, copyShapeRecord(before));
+                redrawBuffer();
+                repaint();
+            }
+        }
+
+        @Override
+        public void redo() {
+            super.redo();
+            if (after != null && index >= 0 && index < shapes.size()) {
+                shapes.set(index, copyShapeRecord(after));
+                redrawBuffer();
+                repaint();
+            }
+        }
+
+        @Override
+        public String getPresentationName() {
+            return "Move/Resize";
+        }
+    }
+
+    // Undoable edit for creating a text shape
+    private class TextCreateEdit extends AbstractUndoableEdit {
+        private final int index;
+        private final ShapeRecord record;
+        private final ReMoDeLEntity entityCopy; // optional model entity snapshot
+
+        TextCreateEdit(int index, ShapeRecord record) {
+            this(index, record, null);
+        }
+
+        TextCreateEdit(int index, ShapeRecord record, ReMoDeLEntity entityCopy) {
+            this.index = index;
+            this.record = record;
+            this.entityCopy = entityCopy;
+        }
+
+        @Override
+        public void undo() {
+            super.undo();
+            // If backed by model, remove from model (listener will update shapes)
+            if (record != null && record.entityId != null && model != null) {
+                model.removeEntity(record.entityId);
+                return;
+            }
+            if (index >= 0 && index < shapes.size()) {
+                shapes.remove(index);
+                redrawBuffer();
+                repaint();
+            }
+        }
+
+        @Override
+        public void redo() {
+            super.redo();
+            if (record != null && record.entityId != null && model != null && entityCopy != null) {
+                // re-add entity to model; model listener will rebuild shapes
+                model.addEntity(entityCopy.copy());
+                return;
+            }
+            if (index >= 0 && index <= shapes.size()) {
+                shapes.add(index, copyShapeRecord(record));
+                redrawBuffer();
+                repaint();
+            }
+        }
+
+        @Override
+        public String getPresentationName() { return "Add Text"; }
+    }
+
+    // Undoable edit for editing text content/font/color
+    private class TextEdit extends AbstractUndoableEdit {
+        private final int index;
+        private final ShapeRecord before;
+        private final ShapeRecord after;
+
+        TextEdit(int index, ShapeRecord before, ShapeRecord after) {
+            this.index = index;
+            this.before = before;
+            this.after = after;
+        }
+
+        @Override
+        public void undo() {
+            super.undo();
+            // if model-backed, update model entity instead (listener will rebuild)
+            String eid = before != null ? before.entityId : null;
+            if (eid != null && model != null) {
+                model.updateEntity(entityFromShape(before));
+                return;
+            }
+            if (index >= 0 && index < shapes.size()) {
+                shapes.set(index, copyShapeRecord(before));
+                redrawBuffer();
+                repaint();
+            }
+        }
+
+        @Override
+        public void redo() {
+            super.redo();
+            String eid = after != null ? after.entityId : null;
+            if (eid != null && model != null) {
+                model.updateEntity(entityFromShape(after));
+                return;
+            }
+            if (index >= 0 && index < shapes.size()) {
+                shapes.set(index, copyShapeRecord(after));
+                redrawBuffer();
+                repaint();
+            }
+        }
+
+        @Override
+        public String getPresentationName() { return "Edit Text"; }
+    }
+
+    // tools
+    public enum Tool {
+        SELECT, DELETE, FREEHAND, LINE,
+        ARROW_FILLED, ARROW_EMPTY, ARROW_DIAMOND, ARROW_OPEN, IMPACT, REFERENCE, ENACTS,
+        OVAL, RECTANGLE, ROUNDED_RECTANGLE, BOUNDARY, OBJECT_TYPE,
+        TEXT, STATE, ACTOR, SYSTEM, AUTHORISATION, INITIAL_TRANSITION, FINAL_TRANSITION
+    }
+    private Tool currentTool = Tool.SELECT;
+
+    // stored shapes
+    private final java.util.List<ShapeRecord> shapes = new ArrayList<>();
+    private ShapeRecord preview = null;
+
+    // pending connector creation (first click source, second click target)
+    private PendingConnector pendingConnector = null;
+
+    // optional backing model and mapping from entity id -> shape index
+    private ReMoDeLModel model = null;
+    private final java.util.Map<String, Integer> idToIndex = new java.util.HashMap<>();
+
+    // Model getter for external access (e.g., for save/export)
+    public ReMoDeLModel getModel() {
+        return model;
+    }
+
+    /**
+     * Returns an export-ready model.
+     * If the canvas has no backing model, build a temporary snapshot model
+     * from current non-connector shapes and connector anchors.
+     */
+    public ReMoDeLModel getExportModel() {
+        if (model != null) return model;
+
+        ReMoDeLModel snapshot = new ReMoDeLModel();
+        Map<String, String> localToEntity = new HashMap<>();
+
+        for (ShapeRecord r : shapes) {
+            if (r == null || isConnectorTool(r.tool)) continue;
+            ReMoDeLEntity ent = entityFromShape(r);
+            snapshot.addEntity(ent);
+            if (r.localId != null) {
+                localToEntity.put(r.localId, ent.getId());
+            }
+        }
+
+        for (ShapeRecord r : shapes) {
+            if (r == null || !isConnectorTool(r.tool)) continue;
+            String fromId = localToEntity.get(r.anchorFromId);
+            String toId = localToEntity.get(r.anchorToId);
+            ReMoDeLEntity connector = new ReMoDeLEntity();
+            connector.setType("connector");
+            connector.put("shapeType", r.tool.name());
+            connector.put("strokeWidth", r.stroke);
+            if (r.color != null) connector.put("colorRGB", r.color.getRGB());
+            if (r.text != null) connector.put("text", r.text);
+
+            if (fromId != null && toId != null) {
+                connector.put("fromId", fromId);
+                connector.put("toId", toId);
+                connector.put("manualPosition", false);
+            } else {
+                connector.put("manualPosition", true);
+                connector.put("x1", (int) Math.round(r.x1));
+                connector.put("y1", (int) Math.round(r.y1));
+                connector.put("x2", (int) Math.round(r.x2));
+                connector.put("y2", (int) Math.round(r.y2));
+            }
+            snapshot.addEntity(connector);
+        }
+
+        return snapshot;
+    }
+
+    public void setReferenceDefaultName(String name) {
+        referenceDefaultName = name != null && !name.isBlank() ? name.trim() : "member";
+    }
+
+    public void setReferenceQualifier(String qualifier) {
+        referenceQualifier = qualifier != null ? qualifier.trim() : "";
+    }
+
+    // selection/edit state
+    private int selectedIndex = -1;
+    private boolean draggingMove = false;
+    private boolean resizing = false;
+    private boolean draggingConnectorEndpoint = false;
+    private int activeConnectorEndpoint = -1; // 0 start, 1 end
+    private int activeHandle = -1; // 0..3 corners
+    private int pressX, pressY;
+    private ShapeRecord clipboardRecord = null;
+    private int pasteSerial = 0;
+
+    private static final int HANDLE_SIZE = 10;
+    private static final int HANDLE_HIT_MARGIN = 6;
+    private static final double CROSSING_ENDPOINT_PADDING = 12.0;
+    private static final double CROSSING_BRIDGE_RADIUS = 8.0;
+
+    public DrawingCanvas() {
+        setPreferredSize(new Dimension(1600, 1200));
+        setBackground(Color.WHITE);
+        setOpaque(true);
+        initMouse();
+        initKeyboardShortcuts();
+        setFocusable(true);
+    }
+
+    private void initKeyboardShortcuts() {
+        int shortcutMask = Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx();
+
+        InputMap inputMap = getInputMap(JComponent.WHEN_FOCUSED);
+        ActionMap actionMap = getActionMap();
+
+        inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_C, shortcutMask), "copySelection");
+        actionMap.put("copySelection", new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                copySelectedShape();
+            }
+        });
+
+        inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_V, shortcutMask), "pasteSelection");
+        actionMap.put("pasteSelection", new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                pasteClipboardShape();
+            }
+        });
+
+        inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_X, shortcutMask), "cutSelection");
+        actionMap.put("cutSelection", new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                cutSelectedShape();
+            }
+        });
+    }
+
+    private static class ShapeRecord implements Serializable {
+        private static final long serialVersionUID = 1L;
+        final Tool tool;
+        final Shape shape; // primary geometry (Line2D, Path2D, Rect/Ellipse)
+        final Color color;
+        final float stroke;
+        // extra data for arrows and geometry
+        final String entityId; // optional associated model entity id (if this shape is backed by ReMoDeLModel)
+        final String localId; // stable id for non-model shapes/connectors
+        final String anchorFromId; // connector source local id
+        final String anchorToId; // connector target local id
+        final double x1, y1, x2, y2;
+        // text-specific
+        final String text;
+        final Font font;
+
+        ShapeRecord(Tool tool, Shape shape, Color color, float stroke, double x1, double y1, double x2, double y2, String text, Font font) {
+            this(tool, shape, color, stroke, x1, y1, x2, y2, text, font, null);
+        }
+
+        ShapeRecord(Tool tool, Shape shape, Color color, float stroke, double x1, double y1, double x2, double y2, String text, Font font, String entityId) {
+            this(tool, shape, color, stroke, x1, y1, x2, y2, text, font, entityId, null, null, null);
+        }
+
+        ShapeRecord(Tool tool, Shape shape, Color color, float stroke, double x1, double y1, double x2, double y2, String text,
+                    Font font, String entityId, String localId, String anchorFromId, String anchorToId) {
+            this.tool = tool;
+            this.shape = shape;
+            this.color = color;
+            this.stroke = stroke;
+            this.x1 = x1; this.y1 = y1; this.x2 = x2; this.y2 = y2;
+            this.text = text; this.font = font;
+            this.entityId = entityId;
+            this.localId = localId != null ? localId : (entityId != null ? entityId : java.util.UUID.randomUUID().toString());
+            this.anchorFromId = anchorFromId;
+            this.anchorToId = anchorToId;
+        }
+
+        // convenience constructor for non-text shapes
+        ShapeRecord(Tool tool, Shape shape, Color color, float stroke, double x1, double y1, double x2, double y2) {
+            this(tool, shape, color, stroke, x1, y1, x2, y2, null, null);
+        }
+
+        // convenience factory for text records (bounding rect + text/font)
+        static ShapeRecord textRecord(String text, Font font, Color color, float stroke, double x, double y, double w, double h) {
+            return textRecord(text, font, color, stroke, x, y, w, h, null);
+        }
+
+        static ShapeRecord stateRecord(String stateName, Font font, Color color, float stroke, double x, double y, double w, double h) {
+            double arc = Math.max(20, Math.min(w, h) / 4.0);
+            Shape rect = new RoundRectangle2D.Double(x, y, w, h, arc, arc);
+            return new ShapeRecord(Tool.STATE, rect, color, stroke, x, y, x + w, y + h, stateName, font, null);
+        }
+
+        static ShapeRecord textRecord(String text, Font font, Color color, float stroke, double x, double y, double w, double h, String entityId) {
+            Shape rect = new Rectangle2D.Double(x, y, w, h);
+            return new ShapeRecord(Tool.TEXT, rect, color, stroke, x, y, x + w, y + h, text, font, entityId);
+        }
+    }
+
+    private static class CanvasSnapshot implements Serializable {
+        private static final long serialVersionUID = 1L;
+        private final java.util.List<ShapeRecord> shapes;
+
+        CanvasSnapshot(java.util.List<ShapeRecord> shapes) {
+            this.shapes = shapes;
+        }
+    }
+
+    // tracks in-progress connector selection (source)
+    private static class PendingConnector {
+        final Tool tool;
+        final String fromEntityId;
+        final Point2D fromPoint;
+
+        PendingConnector(Tool tool, String fromEntityId, Point2D fromPoint) {
+            this.tool = tool;
+            this.fromEntityId = fromEntityId;
+            this.fromPoint = fromPoint;
+        }
+    }
+
+    private void ensureBuffer() {
+
+        if (buf == null || buf.getWidth() != getWidth() || buf.getHeight() != getHeight()) {
+            redrawBuffer();
+        }
+    }
+
+    private void redrawBuffer() {
+
+        BufferedImage newBuf = new BufferedImage(Math.max(1, getWidth()), Math.max(1, getHeight()), BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g = newBuf.createGraphics();
+        g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        // clear background
+        g.setColor(Color.WHITE);
+        g.fillRect(0, 0, newBuf.getWidth(), newBuf.getHeight());
+        // redraw existing shapes into new buffer
+        for (ShapeRecord r : shapes) drawRecord(g, r, false);
+        g.dispose();
+        buf = newBuf;
+    }
+
+    private void initMouse() {
+
+        MouseAdapter ma = new MouseAdapter() {
+            private GeneralPath freePath;
+
+            @Override
+            public void mousePressed(MouseEvent e) {
+                requestFocusInWindow();
+                pressX = lastX = e.getX();
+                pressY = lastY = e.getY();
+                statusConsumer.accept("Drawing...");
+
+                if (currentTool == Tool.FREEHAND) {
+                    freePath = new GeneralPath();
+                    freePath.moveTo(lastX, lastY);
+                    preview = new ShapeRecord(Tool.FREEHAND, freePath, drawColor, strokeWidth, lastX, lastY, lastX, lastY);
+                    repaint();
+                    return;
+                }
+
+                if (currentTool == Tool.SELECT) {
+                    // hit-test shapes from top-most to bottom
+                    int hit = hitTest(lastX, lastY);
+                    if (hit >= 0) {
+                        // if double-clicked, start inline editing
+                        if (e.getClickCount() == 2) {
+                            ShapeRecord sr = shapes.get(hit);
+                            // TEXT items use the existing text editor
+                            if (sr.tool == Tool.TEXT) {
+                                startEditingText(hit);
+                                return;
+                            }
+                                // Shape items (RECTANGLE, OVAL, ROUNDED_RECTANGLE, STATE, ACTOR, SYSTEM) get label editing
+                            else if (sr.tool == Tool.RECTANGLE || sr.tool == Tool.OVAL || 
+                                    sr.tool == Tool.ROUNDED_RECTANGLE || sr.tool == Tool.STATE
+                                    || sr.tool == Tool.ACTOR || sr.tool == Tool.SYSTEM) {
+                                startEditingShapeLabel(hit);
+                                return;
+                            } else if (sr.tool == Tool.OBJECT_TYPE) {
+                                startEditingObjectTypeLabel(hit);
+                                return;
+                            } else if (sr.tool == Tool.IMPACT || sr.tool == Tool.ARROW_OPEN || sr.tool == Tool.ARROW_FILLED 
+                                    || sr.tool == Tool.ARROW_EMPTY || sr.tool == Tool.ARROW_DIAMOND 
+                                    || sr.tool == Tool.INITIAL_TRANSITION || sr.tool == Tool.FINAL_TRANSITION) {
+                                startEditingImpactLabel(hit);
+                                return;
+                            } else if (sr.tool == Tool.REFERENCE) {
+                                startEditingReferenceLabel(hit);
+                                return;
+                            }
+                        }
+                        selectedIndex = hit;
+                        ShapeRecord selected = shapes.get(selectedIndex);
+                        // check if clicked on an edit handle
+                        if (isConnectorTool(selected.tool)) {
+                            activeConnectorEndpoint = connectorHandleHit(selected, lastX, lastY);
+                            if (activeConnectorEndpoint >= 0) {
+                                draggingConnectorEndpoint = true;
+                            } else {
+                                draggingMove = true;
+                            }
+                        } else {
+                            Rectangle2D bounds = getShapeBounds(selected);
+                            activeHandle = handleHit(bounds, lastX, lastY);
+                            if (activeHandle >= 0) {
+                                resizing = true;
+                            } else {
+                                draggingMove = true;
+                            }
+                        }
+                        // start a grouped move/resize edit: capture the original record
+                        ShapeRecord before = copyShapeRecord(shapes.get(selectedIndex));
+                        currentMoveEdit = new MoveEdit(selectedIndex, before);
+                        repaint();
+                    } else {
+                        // clicked empty area -> clear selection
+                        selectedIndex = -1;
+                        repaint();
+                    }
+                }
+
+                // other drawing tools: set preview (but TEXT uses separate placer and shouldn't show preview)
+                if (currentTool != Tool.TEXT) {
+                    preview = createPreview(lastX, lastY, lastX, lastY);
+                } else {
+                    preview = null;
+                }
+                repaint();
+            }
+
+            @Override
+            public void mouseDragged(MouseEvent e) {
+                int x = e.getX(), y = e.getY();
+                // If TEXT tool is active, dragging should not create/update previews or shapes.
+                if (currentTool == Tool.TEXT) {
+                    lastX = x; lastY = y;
+                    return;
+                }
+                if (currentTool == Tool.FREEHAND && preview != null && preview.shape instanceof GeneralPath) {
+                    ((GeneralPath) preview.shape).lineTo(x, y);
+                    lastX = x; lastY = y;
+                    repaint();
+                    return;
+                }
+
+                if (currentTool == Tool.SELECT) {
+                    if (selectedIndex >= 0) {
+                        ShapeRecord sel = shapes.get(selectedIndex);
+                        int dx = x - lastX, dy = y - lastY;
+
+                        if (draggingConnectorEndpoint && isConnectorTool(sel.tool)) {
+                            ShapeRecord nr = updateConnectorEndpointRecord(sel, activeConnectorEndpoint, x, y);
+                            if (nr != null) {
+                                if (sel.entityId != null && model != null) {
+                                    ReMoDeLEntity ent = model.get(sel.entityId);
+                                    if (ent != null) {
+                                        ReMoDeLEntity copy = ent.copy();
+                                        String fromEntityId = nr.anchorFromId != null ? findEntityIdByLocalId(nr.anchorFromId) : null;
+                                        String toEntityId = nr.anchorToId != null ? findEntityIdByLocalId(nr.anchorToId) : null;
+                                        copy.put("fromId", fromEntityId);
+                                        copy.put("toId", toEntityId);
+                                        copy.put("shapeType", nr.tool.name());
+                                        copy.put("manualPosition", fromEntityId == null || toEntityId == null);
+                                        copy.put("x1", (int) Math.round(nr.x1));
+                                        copy.put("y1", (int) Math.round(nr.y1));
+                                        copy.put("x2", (int) Math.round(nr.x2));
+                                        copy.put("y2", (int) Math.round(nr.y2));
+                                        if (nr.text != null) copy.put("text", nr.text);
+                                        model.updateEntity(copy);
+                                    }
+                                } else {
+                                    shapes.set(selectedIndex, nr);
+                                    redrawBuffer();
+                                    repaint();
+                                }
+                            }
+                        } else if (draggingMove) {
+                            // translate shape by dx,dy
+                            if (isConnectorTool(sel.tool)) {
+                                Shape moved = AffineTransform.getTranslateInstance(dx, dy).createTransformedShape(sel.shape);
+                                ShapeRecord nr = new ShapeRecord(sel.tool, moved, sel.color, sel.stroke,
+                                        sel.x1 + dx, sel.y1 + dy, sel.x2 + dx, sel.y2 + dy, sel.text, sel.font,
+                                        sel.entityId, sel.localId, null, null);
+                                if (sel.entityId != null && model != null) {
+                                    ReMoDeLEntity ent = model.get(sel.entityId);
+                                    if (ent != null) {
+                                        ReMoDeLEntity copy = ent.copy();
+                                        copy.put("shapeType", nr.tool.name());
+                                        copy.put("fromId", null);
+                                        copy.put("toId", null);
+                                        copy.put("manualPosition", true);
+                                        copy.put("x1", (int) Math.round(nr.x1));
+                                        copy.put("y1", (int) Math.round(nr.y1));
+                                        copy.put("x2", (int) Math.round(nr.x2));
+                                        copy.put("y2", (int) Math.round(nr.y2));
+                                        if (nr.color != null) copy.put("colorRGB", nr.color.getRGB());
+                                        copy.put("strokeWidth", nr.stroke);
+                                        if (nr.text != null) copy.put("text", nr.text);
+                                        model.updateEntity(copy);
+                                    }
+                                }
+                                shapes.set(selectedIndex, nr);
+                            } else if (sel.tool == Tool.TEXT) {
+                                // preserve text and font when translating
+                                double nx1 = sel.x1 + dx, ny1 = sel.y1 + dy, nx2 = sel.x2 + dx, ny2 = sel.y2 + dy;
+                                Shape rect = new Rectangle2D.Double(Math.min(nx1, nx2), Math.min(ny1, ny2), Math.abs(nx2 - nx1), Math.abs(ny2 - ny1));
+                                ShapeRecord nr = new ShapeRecord(Tool.TEXT, rect, sel.color, sel.stroke, nx1, ny1, nx2, ny2, sel.text, sel.font,
+                                        sel.entityId, sel.localId, sel.anchorFromId, sel.anchorToId);
+                                if (sel.entityId != null && model != null) {
+                                    model.updateEntity(entityFromShape(nr));
+                                } else {
+                                    shapes.set(selectedIndex, nr);
+                                    reanchorConnectorsFor(nr.localId);
+                                }
+                            } else {
+                                Shape moved = AffineTransform.getTranslateInstance(dx, dy).createTransformedShape(sel.shape);
+                                ShapeRecord nr = new ShapeRecord(sel.tool, moved, sel.color, sel.stroke,
+                                        sel.x1 + dx, sel.y1 + dy, sel.x2 + dx, sel.y2 + dy, sel.text, sel.font,
+                                        sel.entityId, sel.localId, sel.anchorFromId, sel.anchorToId);
+                                if (sel.entityId != null && model != null) {
+                                    model.updateEntity(entityFromShape(nr));
+                                } else {
+                                    shapes.set(selectedIndex, nr);
+                                    reanchorConnectorsFor(nr.localId);
+                                }
+                            }
+                            redrawBuffer();
+                            repaint();
+                        } else if (resizing) {
+                            // compute new bounds using which corner is dragged
+                            Rectangle2D b = getShapeBounds(sel);
+                            double x1 = b.getX(), y1 = b.getY(), x2 = b.getX() + b.getWidth(), y2 = b.getY() + b.getHeight();
+                            switch (activeHandle) {
+                                case 0: // top-left
+                                    x1 = x; y1 = y;
+                                    break;
+                                case 1: // top-right
+                                    x2 = x; y1 = y;
+                                    break;
+                                case 2: // bottom-right
+                                    x2 = x; y2 = y;
+                                    break;
+                                case 3: // bottom-left
+                                    x1 = x; y2 = y;
+                                    break;
+                                case 4: // top edge
+                                    y1 = y;
+                                    break;
+                                case 5: // right edge
+                                    x2 = x;
+                                    break;
+                                case 6: // bottom edge
+                                    y2 = y;
+                                    break;
+                                case 7: // left edge
+                                    x1 = x;
+                                    break;
+                                default:
+                                    break;
+                            }
+                            if (sel.tool == Tool.TEXT) {
+                                // resize text box, preserve text/font
+                                ShapeRecord nr = new ShapeRecord(Tool.TEXT,
+                                        new Rectangle2D.Double(Math.min(x1, x2), Math.min(y1, y2), Math.abs(x2 - x1), Math.abs(y2 - y1)),
+                                        sel.color, sel.stroke, x1, y1, x2, y2, sel.text, sel.font,
+                                        sel.entityId, sel.localId, sel.anchorFromId, sel.anchorToId);
+                                if (sel.entityId != null && model != null) {
+                                    model.updateEntity(entityFromShape(nr));
+                                } else {
+                                    shapes.set(selectedIndex, nr);
+                                    reanchorConnectorsFor(nr.localId);
+                                }
+                                redrawBuffer();
+                                repaint();
+                            } else {
+                                ShapeRecord nr = createRecordFromTool(sel.tool, sel.color, sel.stroke, (int)x1, (int)y1, (int)x2, (int)y2);
+                                if (nr != null) {
+                                    if (sel.entityId != null && model != null) {
+                                        // preserve entity id
+                                        ShapeRecord withId = new ShapeRecord(nr.tool, nr.shape, nr.color, nr.stroke, nr.x1, nr.y1, nr.x2, nr.y2, nr.text, nr.font, sel.entityId);
+                                        model.updateEntity(entityFromShape(withId));
+                                    } else {
+                                        ShapeRecord withId = new ShapeRecord(nr.tool, nr.shape, nr.color, nr.stroke, nr.x1, nr.y1, nr.x2, nr.y2,
+                                                nr.text, nr.font, sel.entityId, sel.localId, sel.anchorFromId, sel.anchorToId);
+                                        shapes.set(selectedIndex, withId);
+                                        reanchorConnectorsFor(withId.localId);
+                                    }
+                                    redrawBuffer();
+                                    repaint();
+                                }
+                            }
+                        }
+                    }
+                    lastX = x; lastY = y;
+                    return;
+                }
+
+                // other drawing tools: update preview
+                preview = createPreview(pressX, pressY, x, y);
+                lastX = x; lastY = y;
+                repaint();
+            }
+
+            @Override
+            public void mouseReleased(MouseEvent e) {
+                int x = e.getX(), y = e.getY();
+                if (currentTool == Tool.FREEHAND) {
+                    if (preview != null) {
+                        if (model != null) {
+                            ReMoDeLEntity ent = entityFromShape(preview);
+                            model.addEntity(ent);
+                        } else {
+                            shapes.add(preview);
+                        }
+                        Graphics2D g = getBufferGraphics();
+                        drawRecord(g, preview, false);
+                        g.dispose();
+                        preview = null;
+                        repaint();
+                    }
+                    lastX = lastY = -1;
+                    statusConsumer.accept("Ready");
+                    return;
+                }
+
+                if (currentTool == Tool.SELECT) {
+                    // finish move/resize
+                    draggingMove = false;
+                    resizing = false;
+                    draggingConnectorEndpoint = false;
+                    activeHandle = -1;
+                    activeConnectorEndpoint = -1;
+                    // finalize move/resize undo edit
+                    if (currentMoveEdit != null) {
+                        // capture 'after' state if shape still exists at that index
+                        if (selectedIndex >= 0 && selectedIndex < shapes.size()) {
+                            currentMoveEdit.setAfter(copyShapeRecord(shapes.get(selectedIndex)));
+                        }
+                        addUndoableEdit(currentMoveEdit);
+                        currentMoveEdit = null;
+                    }
+                    redrawBuffer();
+                    repaint();
+                    statusConsumer.accept("Ready");
+                    return;
+                }
+
+                if (preview != null && isConnectorTool(currentTool)) {
+                    int fromIdx = findAnchorTarget(pressX, pressY);
+                    int toIdx = findAnchorTarget(x, y);
+                    if (fromIdx >= 0 && toIdx >= 0 && fromIdx != toIdx) {
+                        ShapeRecord fromShape = shapes.get(fromIdx);
+                        ShapeRecord toShape = shapes.get(toIdx);
+                        Point2D.Double[] anchors = computeConnectorAnchors(fromShape, toShape);
+                        Point2D.Double start = anchors[0];
+                        Point2D.Double end = anchors[1];
+                        Shape line = new Line2D.Double(start.x, start.y, end.x, end.y);
+
+                        if (model != null && fromShape.entityId != null && toShape.entityId != null) {
+                            ReMoDeLEntity ent = new ReMoDeLEntity();
+                            ent.setType("connector");
+                            ent.put("fromId", fromShape.entityId);
+                            ent.put("toId", toShape.entityId);
+                            ent.put("shapeType", currentTool.name());
+                            ent.put("colorRGB", drawColor.getRGB());
+                            ent.put("strokeWidth", strokeWidth);
+                            ent.put("text", getConnectorLabel(currentTool, null));
+                            model.addEntity(ent);
+                        } else {
+                            String label = getConnectorLabel(currentTool, null);
+                            Font labelFont = new Font("SansSerif", Font.PLAIN, 12);
+                            ShapeRecord anchored = new ShapeRecord(currentTool, line, drawColor, strokeWidth,
+                                start.x, start.y, end.x, end.y, label, labelFont, null,
+                                null, fromShape.localId, toShape.localId);
+                            shapes.add(anchored);
+                            Graphics2D g = getBufferGraphics();
+                            drawRecord(g, anchored, false);
+                            g.dispose();
+                        }
+
+                        preview = null;
+                        lastX = lastY = -1;
+                        statusConsumer.accept("Ready");
+                        repaint();
+                        return;
+                    }
+                }
+
+                if (preview != null) {
+                    if (model != null) {
+                        ReMoDeLEntity ent = entityFromShape(preview);
+                        model.addEntity(ent);
+                    } else {
+                        shapes.add(preview);
+                    }
+                    Graphics2D g = getBufferGraphics();
+                    drawRecord(g, preview, false);
+                    g.dispose();
+                    preview = null;
+                    setCurrentTool(Tool.SELECT);
+                }
+                lastX = lastY = -1;
+                statusConsumer.accept("Ready");
+                repaint();
+            }
+        };
+        addMouseListener(ma);
+        addMouseMotionListener(ma);
+        addComponentListener(new ComponentAdapter() {
+            public void componentResized(ComponentEvent e) {
+                ensureBuffer();
+                repaint();
+            }
+        });
+    }
+
+    private void startEditingShapeLabel(int index) {
+        if (index < 0 || index >= shapes.size()) return;
+        ShapeRecord sel = shapes.get(index);
+        
+        // Only editable shapes
+        if (sel.tool != Tool.RECTANGLE && sel.tool != Tool.OVAL && 
+            sel.tool != Tool.ROUNDED_RECTANGLE && sel.tool != Tool.STATE &&
+            sel.tool != Tool.ACTOR && sel.tool != Tool.SYSTEM) {
+            return;
+        }
+        
+        selectedIndex = index;
+        Rectangle2D b = getShapeBounds(sel);
+        if (b == null) return;
+
+        // Current text (default label based on shape type)
+        String currentText = sel.text != null ? sel.text : getDefaultLabelForTool(sel.tool);
+        
+        final JTextField tf = new JTextField(currentText);
+        tf.setOpaque(true);
+        tf.setBackground(new Color(255, 255, 255));
+        tf.setForeground(sel.color != null ? sel.color : drawColor);
+        tf.setFont(sel.font != null ? sel.font : new Font("SansSerif", Font.PLAIN, 12));
+        tf.setHorizontalAlignment(JTextField.CENTER);
+
+        // Apply shape-specific border styling
+        switch (sel.tool) {
+            case STATE:
+                // Pill shape border (fully rounded ends)
+                int radius = (int) b.getHeight();
+                tf.setBorder(BorderFactory.createCompoundBorder(
+                    new RoundedBorder(radius),
+                    BorderFactory.createEmptyBorder(3, 10, 3, 10) // padding
+                ));
+                break;
+            case OVAL:
+                // Elliptical/oval border
+                tf.setBorder(BorderFactory.createCompoundBorder(
+                    new EllipseBorder(),
+                    BorderFactory.createEmptyBorder(4, 8, 4, 8)
+                ));
+                break;
+            case ROUNDED_RECTANGLE:
+                // Rounded rectangle border
+                tf.setBorder(BorderFactory.createCompoundBorder(
+                    new RoundedBorder(15),
+                    BorderFactory.createEmptyBorder(4, 8, 4, 8)
+                ));
+                break;
+            case RECTANGLE:
+            default:
+                // Standard rectangular border
+                tf.setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(null, 0),
+                    BorderFactory.createEmptyBorder(4, 8, 4, 8)
+                ));
+                break;
+        }
+
+        tf.setBounds((int) b.getX() + 4, (int) b.getY() + 4, 
+                    Math.max(40, (int) b.getWidth() - 8), Math.max(20, (int) b.getHeight() - 8));
+        
+        this.add(tf);
+        this.revalidate();
+        this.repaint();
+        tf.requestFocusInWindow();
+        tf.selectAll();
+
+        Runnable finish = () -> {
+            String newText = tf.getText().trim();
+            if (newText.isEmpty()) newText = getDefaultLabelForTool(sel.tool);
+            DrawingCanvas.this.remove(tf);
+            updateShapeLabel(newText, index);
+            DrawingCanvas.this.revalidate();
+            DrawingCanvas.this.repaint();
+        };
+
+        Runnable cancel = () -> {
+            DrawingCanvas.this.remove(tf);
+            DrawingCanvas.this.revalidate();
+            DrawingCanvas.this.repaint();
+        };
+
+        // Commit on Enter
+        tf.getInputMap(JComponent.WHEN_FOCUSED).put(
+            KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0), "commit");
+        tf.getActionMap().put("commit", new AbstractAction() {
+            @Override public void actionPerformed(ActionEvent e) { finish.run(); }
+        });
+        
+        // Cancel on Escape
+        tf.getInputMap(JComponent.WHEN_FOCUSED).put(
+            KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), "cancel");
+        tf.getActionMap().put("cancel", new AbstractAction() {
+            @Override public void actionPerformed(ActionEvent e) { cancel.run(); }
+        });
+
+        tf.addFocusListener(new FocusAdapter() {
+            @Override public void focusLost(FocusEvent e) {
+                finish.run();
+            }
+        });
+    }
+
+    private void startEditingObjectTypeLabel(int index) {
+        if (index < 0 || index >= shapes.size()) return;
+        ShapeRecord sel = shapes.get(index);
+        if (sel.tool != Tool.OBJECT_TYPE) return;
+        selectedIndex = index;
+
+        Rectangle2D b = getShapeBounds(sel);
+        if (b == null) return;
+
+        String currentText = sel.text != null ? sel.text : getDefaultLabelForTool(sel.tool);
+        Font font = sel.font != null ? sel.font : new Font("SansSerif", Font.PLAIN, 12);
+
+        final JTextArea ta = new JTextArea(currentText);
+        ta.setLineWrap(true);
+        ta.setWrapStyleWord(true);
+        ta.setOpaque(true);
+        ta.setBackground(new Color(255, 255, 255));
+        ta.setForeground(sel.color != null ? sel.color : drawColor);
+        ta.setFont(font);
+
+        ta.setBounds((int) b.getX() + 4, (int) b.getY() + 4,
+            Math.max(60, (int) b.getWidth() - 8), Math.max(40, (int) b.getHeight() - 8));
+
+        this.add(ta);
+        this.revalidate();
+        this.repaint();
+        ta.requestFocusInWindow();
+        ta.selectAll();
+
+        Runnable finish = () -> {
+            String newText = ta.getText().trim();
+            if (newText.isEmpty()) newText = getDefaultLabelForTool(sel.tool);
+            DrawingCanvas.this.remove(ta);
+            updateShapeLabel(newText, index);
+            DrawingCanvas.this.revalidate();
+            DrawingCanvas.this.repaint();
+        };
+
+        Runnable cancel = () -> {
+            DrawingCanvas.this.remove(ta);
+            DrawingCanvas.this.revalidate();
+            DrawingCanvas.this.repaint();
+        };
+
+        ta.getInputMap(JComponent.WHEN_FOCUSED).put(
+            KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, InputEvent.CTRL_DOWN_MASK), "commit");
+        ta.getActionMap().put("commit", new AbstractAction() {
+            @Override public void actionPerformed(ActionEvent e) { finish.run(); }
+        });
+
+        ta.getInputMap(JComponent.WHEN_FOCUSED).put(
+            KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), "cancel");
+        ta.getActionMap().put("cancel", new AbstractAction() {
+            @Override public void actionPerformed(ActionEvent e) { cancel.run(); }
+        });
+
+        ta.addFocusListener(new FocusAdapter() {
+            @Override public void focusLost(FocusEvent e) {
+                finish.run();
+            }
+        });
+    }
+
+    private void startEditingImpactLabel(int index) {
+        if (index < 0 || index >= shapes.size()) return;
+        ShapeRecord sel = shapes.get(index);
+        if (sel.tool != Tool.IMPACT && sel.tool != Tool.REFERENCE && sel.tool != Tool.ARROW_OPEN 
+            && sel.tool != Tool.ARROW_FILLED && sel.tool != Tool.ARROW_EMPTY && sel.tool != Tool.ARROW_DIAMOND) return;
+        selectedIndex = index;
+
+        String currentText = sel.text != null ? sel.text : getDefaultLabelForTool(sel.tool);
+        Font font = sel.font != null ? sel.font : new Font("SansSerif", Font.PLAIN, 12);
+
+        final JTextField tf = new JTextField(currentText);
+        tf.setOpaque(true);
+        tf.setBackground(new Color(255, 255, 255));
+        tf.setForeground(sel.color != null ? sel.color : drawColor);
+        tf.setFont(font);
+        tf.setHorizontalAlignment(JTextField.CENTER);
+
+        FontMetrics fm = getFontMetrics(font);
+        int textW = Math.max(60, fm.stringWidth(currentText) + 16);
+        int textH = Math.max(20, fm.getHeight() + 4);
+        int midX = (int) Math.round((sel.x1 + sel.x2) / 2.0);
+        int midY = (int) Math.round((sel.y1 + sel.y2) / 2.0);
+
+        tf.setBounds(midX - textW / 2, midY - textH - 8, textW, textH);
+
+        this.add(tf);
+        this.revalidate();
+        this.repaint();
+        tf.requestFocusInWindow();
+        tf.selectAll();
+
+        Runnable finish = () -> {
+            String newText = tf.getText().trim();
+            if (newText.isEmpty()) newText = getDefaultLabelForTool(sel.tool);
+            DrawingCanvas.this.remove(tf);
+            updateShapeLabel(newText, index);
+            DrawingCanvas.this.revalidate();
+            DrawingCanvas.this.repaint();
+        };
+
+        Runnable cancel = () -> {
+            DrawingCanvas.this.remove(tf);
+            DrawingCanvas.this.revalidate();
+            DrawingCanvas.this.repaint();
+        };
+
+        tf.getInputMap(JComponent.WHEN_FOCUSED).put(
+            KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0), "commit");
+        tf.getActionMap().put("commit", new AbstractAction() {
+            @Override public void actionPerformed(ActionEvent e) { finish.run(); }
+        });
+
+        tf.getInputMap(JComponent.WHEN_FOCUSED).put(
+            KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), "cancel");
+        tf.getActionMap().put("cancel", new AbstractAction() {
+            @Override public void actionPerformed(ActionEvent e) { cancel.run(); }
+        });
+
+        tf.addFocusListener(new FocusAdapter() {
+            @Override public void focusLost(FocusEvent e) {
+                finish.run();
+            }
+        });
+    }
+
+    private void startEditingReferenceLabel(int index) {
+        if (index < 0 || index >= shapes.size()) return;
+        ShapeRecord sel = shapes.get(index);
+        if (sel.tool != Tool.REFERENCE) return;
+        selectedIndex = index;
+
+        String currentText = sel.text != null ? sel.text : getDefaultLabelForTool(sel.tool);
+        Font font = sel.font != null ? sel.font : new Font("SansSerif", Font.PLAIN, 12);
+
+        final JTextArea ta = new JTextArea(currentText);
+        ta.setLineWrap(true);
+        ta.setWrapStyleWord(true);
+        ta.setOpaque(true);
+        ta.setBackground(new Color(255, 255, 255));
+        ta.setForeground(sel.color != null ? sel.color : drawColor);
+        ta.setFont(font);
+
+        FontMetrics fm = getFontMetrics(font);
+        int textW = Math.max(80, fm.stringWidth(currentText) + 20);
+        int textH = Math.max(36, fm.getHeight() * 2 + 6);
+        int midX = (int) Math.round((sel.x1 + sel.x2) / 2.0);
+        int midY = (int) Math.round((sel.y1 + sel.y2) / 2.0);
+
+        ta.setBounds(midX - textW / 2, midY - textH - 8, textW, textH);
+
+        this.add(ta);
+        this.revalidate();
+        this.repaint();
+        ta.requestFocusInWindow();
+        ta.selectAll();
+
+        Runnable finish = () -> {
+            String newText = ta.getText().trim();
+            if (newText.isEmpty()) newText = getDefaultLabelForTool(sel.tool);
+            DrawingCanvas.this.remove(ta);
+            updateShapeLabel(newText, index);
+            DrawingCanvas.this.revalidate();
+            DrawingCanvas.this.repaint();
+        };
+
+        Runnable cancel = () -> {
+            DrawingCanvas.this.remove(ta);
+            DrawingCanvas.this.revalidate();
+            DrawingCanvas.this.repaint();
+        };
+
+        ta.getInputMap(JComponent.WHEN_FOCUSED).put(
+            KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, InputEvent.CTRL_DOWN_MASK), "commit");
+        ta.getActionMap().put("commit", new AbstractAction() {
+            @Override public void actionPerformed(ActionEvent e) { finish.run(); }
+        });
+
+        ta.getInputMap(JComponent.WHEN_FOCUSED).put(
+            KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), "cancel");
+        ta.getActionMap().put("cancel", new AbstractAction() {
+            @Override public void actionPerformed(ActionEvent e) { cancel.run(); }
+        });
+
+        ta.addFocusListener(new FocusAdapter() {
+            @Override public void focusLost(FocusEvent e) {
+                finish.run();
+            }
+        });
+    }
+
+    /**
+     * Custom border that draws a rounded rectangle outline matching STATE shapes.
+     */
+    class RoundedBorder implements javax.swing.border.Border {
+        private final int radius;
+        
+        public RoundedBorder(int radius) {
+            this.radius = radius;
+        }
+        
+        @Override
+        public void paintBorder(Component c, Graphics g, int x, int y, int width, int height) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g2.setColor(new Color(0, 0, 0)); 
+            // g2.setStroke(new BasicStroke(2));
+            // g2.drawRoundRect(x, y, width + 1, height, radius, radius);
+            g2.dispose();
+        }
+        
+        @Override
+        public Insets getBorderInsets(Component c) {
+            return new Insets(2, 2, 2, 2);
+        }
+        
+        @Override
+        public boolean isBorderOpaque() {
+            return false;
+        }
+    }
+
+    /**
+     * Custom border that draws an elliptical outline matching OVAL/Task shapes.
+     */
+    class EllipseBorder implements javax.swing.border.Border {
+        
+        @Override
+        public void paintBorder(Component c, Graphics g, int x, int y, int width, int height) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g2.setColor(new Color(100, 150, 255)); // Blue outline
+            // g2.setStroke(new BasicStroke(2));
+            // g2.drawOval(x, y, width - 1, height - 1);
+            g2.dispose();
+        }
+        
+        @Override
+        public Insets getBorderInsets(Component c) {
+            return new Insets(2, 2, 2, 2);
+        }
+        
+        @Override
+        public boolean isBorderOpaque() {
+            return false;
+        }
+    }
+
+    /**
+     * Get the default label text for a given tool type.
+     */
+    private String getDefaultLabelForTool(Tool tool) {
+        switch (tool) {
+            case RECTANGLE: return "Object";
+            case OBJECT_TYPE: return "Object\nattribute";
+            case ACTOR: return "Actor";
+            case SYSTEM: return "System";
+            case OVAL: return "Task";
+            case ROUNDED_RECTANGLE: return "Process";
+            case STATE: return "State";
+            case LINE: return "Association";
+            case AUTHORISATION: return "Authorisation";
+            case ARROW_FILLED: return "datum";
+            case ARROW_EMPTY: return "Generalisation";
+            case ARROW_DIAMOND: return "Composition";
+            case ARROW_OPEN: return "event";
+            case INITIAL_TRANSITION: return "enter";
+            case FINAL_TRANSITION: return "exit";
+            case IMPACT: return "create";
+            case REFERENCE: {
+                if (referenceQualifier == null || referenceQualifier.isBlank()) return referenceDefaultName;
+                return referenceDefaultName + "\n{" + referenceQualifier + "}";
+            }
+            default: return "Label";
+        }
+    }
+
+    private ShapeRecord growShapeForLabel(ShapeRecord sel, String text) {
+        if (sel == null) return null;
+        if (text == null) text = "";
+
+        Font font = sel.font != null ? sel.font : new Font("SansSerif", Font.PLAIN, 12);
+        FontMetrics fm = getFontMetrics(font);
+        Rectangle2D b = getShapeBounds(sel);
+        if (b == null) return sel;
+
+        String[] lines = text.split("\\R", -1);
+        if (lines.length == 0) lines = new String[] { "" };
+
+        int maxLineW = 0;
+        for (String line : lines) {
+            maxLineW = Math.max(maxLineW, fm.stringWidth(line != null ? line : ""));
+        }
+
+        double requiredW = b.getWidth();
+        double requiredH = b.getHeight();
+
+        switch (sel.tool) {
+            case OBJECT_TYPE:
+                requiredW = Math.max(requiredW, maxLineW + 28);
+                requiredH = Math.max(requiredH, Math.max(40, lines.length * fm.getHeight() + 20));
+                break;
+            case ACTOR:
+                // Actor label is drawn outside the shape; only grow width to keep names readable.
+                requiredW = Math.max(requiredW, maxLineW + 20);
+                break;
+            default:
+                requiredW = Math.max(requiredW, maxLineW + 20);
+                requiredH = Math.max(requiredH, Math.max(24, lines.length * fm.getHeight() + 12));
+                break;
+        }
+
+        if (requiredW <= b.getWidth() && requiredH <= b.getHeight()) {
+            return new ShapeRecord(sel.tool, sel.shape, sel.color, sel.stroke,
+                sel.x1, sel.y1, sel.x2, sel.y2,
+                text, font, sel.entityId, sel.localId, sel.anchorFromId, sel.anchorToId);
+        }
+
+        double cx = b.getCenterX();
+        double cy = b.getCenterY();
+        int nx1 = (int) Math.round(cx - requiredW / 2.0);
+        int ny1 = (int) Math.round(cy - requiredH / 2.0);
+        int nx2 = (int) Math.round(cx + requiredW / 2.0);
+        int ny2 = (int) Math.round(cy + requiredH / 2.0);
+
+        ShapeRecord grown = createRecordFromTool(sel.tool, sel.color, sel.stroke, nx1, ny1, nx2, ny2);
+        if (grown == null) {
+            return new ShapeRecord(sel.tool, sel.shape, sel.color, sel.stroke,
+                sel.x1, sel.y1, sel.x2, sel.y2,
+                text, font, sel.entityId, sel.localId, sel.anchorFromId, sel.anchorToId);
+        }
+
+        return new ShapeRecord(grown.tool, grown.shape, grown.color, grown.stroke,
+            grown.x1, grown.y1, grown.x2, grown.y2,
+            text, font, sel.entityId, sel.localId, sel.anchorFromId, sel.anchorToId);
+    }
+
+    /**
+     * Update the label text for a shape at the given index.
+     */
+    private void updateShapeLabel(String newText, int index) {
+        if (index < 0 || index >= shapes.size()) return;
+        ShapeRecord sel = shapes.get(index);
+        ShapeRecord nr = growShapeForLabel(sel, newText);
+        if (nr == null) return;
+        
+        // Register undo
+        ShapeRecord before = copyShapeRecord(sel);
+        ShapeRecord after = copyShapeRecord(nr);
+
+        // Update local state immediately so subsequent drag operations don't overwrite
+        // the edited text with stale/default labels while model listeners are pending.
+        shapes.set(index, nr);
+        if (!isConnectorTool(nr.tool)) {
+            reanchorConnectorsFor(nr.localId);
+        } else {
+            redrawBuffer();
+            repaint();
+        }
+        
+        // Update shape (via model if backed by one)
+        if (sel.entityId != null && model != null) {
+            if (isConnectorTool(sel.tool)) {
+                ReMoDeLEntity ent = model.get(sel.entityId);
+                if (ent != null) {
+                    ReMoDeLEntity copy = ent.copy();
+                    copy.put("text", newText);
+                    model.updateEntity(copy);
+                }
+            } else {
+                model.updateEntity(entityFromShape(after));
+            }
+        }
+        
+        addUndoableEdit(new TextEdit(index, before, after));
+    }
+
+    private int hitTest(int x, int y) {
+
+        Point2D p = new Point2D.Double(x, y);
+        for (int i = shapes.size() - 1; i >= 0; i--) {
+            ShapeRecord r = shapes.get(i);
+            Shape pick = new BasicStroke(Math.max(6f, r.stroke + 6f)).createStrokedShape(r.shape);
+            if (pick.contains(p)) return i;
+            // for filled shapes also test interior
+            try {
+                if (r.shape.contains(p)) return i;
+            } catch (Exception ignored) {}
+        }
+        return -1;
+    }
+
+    private Rectangle2D getShapeBounds(ShapeRecord r) {
+
+        return r.shape.getBounds2D();
+    }
+
+    private int handleHit(Rectangle2D b, int x, int y) {
+
+        if (b == null) return -1;
+        double hx = b.getX(), hy = b.getY(), hw = b.getWidth(), hh = b.getHeight();
+
+        double mx = hx + hw / 2.0;
+        double my = hy + hh / 2.0;
+        double edgeHandle = Math.max(8, HANDLE_SIZE - 2);
+
+        Rectangle2D[] handles = new Rectangle2D[] {
+                new Rectangle2D.Double(hx - HANDLE_SIZE/2, hy - HANDLE_SIZE/2, HANDLE_SIZE, HANDLE_SIZE), // tl
+                new Rectangle2D.Double(hx + hw - HANDLE_SIZE/2, hy - HANDLE_SIZE/2, HANDLE_SIZE, HANDLE_SIZE), // tr
+                new Rectangle2D.Double(hx + hw - HANDLE_SIZE/2, hy + hh - HANDLE_SIZE/2, HANDLE_SIZE, HANDLE_SIZE), // br
+            new Rectangle2D.Double(hx - HANDLE_SIZE/2, hy + hh - HANDLE_SIZE/2, HANDLE_SIZE, HANDLE_SIZE), // bl
+            new Rectangle2D.Double(mx - edgeHandle/2, hy - edgeHandle/2, edgeHandle, edgeHandle), // top
+            new Rectangle2D.Double(hx + hw - edgeHandle/2, my - edgeHandle/2, edgeHandle, edgeHandle), // right
+            new Rectangle2D.Double(mx - edgeHandle/2, hy + hh - edgeHandle/2, edgeHandle, edgeHandle), // bottom
+            new Rectangle2D.Double(hx - edgeHandle/2, my - edgeHandle/2, edgeHandle, edgeHandle) // left
+        };
+        for (int i = 0; i < handles.length; i++) {
+            if (handles[i].contains(x, y)) return i;
+            Rectangle2D expanded = new Rectangle2D.Double(
+                handles[i].getX() - HANDLE_HIT_MARGIN,
+                handles[i].getY() - HANDLE_HIT_MARGIN,
+                handles[i].getWidth() + HANDLE_HIT_MARGIN * 2.0,
+                handles[i].getHeight() + HANDLE_HIT_MARGIN * 2.0
+            );
+            if (expanded.contains(x, y)) return i;
+        }
+        return -1;
+    }
+
+    private int connectorHandleHit(ShapeRecord r, int x, int y) {
+        if (r == null) return -1;
+        double h = HANDLE_SIZE + HANDLE_HIT_MARGIN;
+        Rectangle2D start = new Rectangle2D.Double(r.x1 - h / 2.0, r.y1 - h / 2.0, h, h);
+        Rectangle2D end = new Rectangle2D.Double(r.x2 - h / 2.0, r.y2 - h / 2.0, h, h);
+        if (start.contains(x, y)) return 0;
+        if (end.contains(x, y)) return 1;
+        return -1;
+    }
+
+    private ShapeRecord snapConnectorToTouchedShapes(ShapeRecord sel) {
+        if (sel == null || !isConnectorTool(sel.tool)) return sel;
+
+        ShapeRecord fromShape = null;
+        ShapeRecord toShape = null;
+
+        int fromIdx = findAnchorTarget((int) Math.round(sel.x1), (int) Math.round(sel.y1));
+        if (fromIdx >= 0 && fromIdx < shapes.size()) {
+            fromShape = shapes.get(fromIdx);
+        }
+
+        int toIdx = findAnchorTarget((int) Math.round(sel.x2), (int) Math.round(sel.y2));
+        if (toIdx >= 0 && toIdx < shapes.size()) {
+            toShape = shapes.get(toIdx);
+        }
+
+        String fromAnchor = fromShape != null ? fromShape.localId : null;
+        String toAnchor = toShape != null ? toShape.localId : null;
+
+        double nx1 = sel.x1;
+        double ny1 = sel.y1;
+        double nx2 = sel.x2;
+        double ny2 = sel.y2;
+
+        if (fromShape != null && toShape != null && fromShape != toShape) {
+            Point2D.Double[] anchors = computeConnectorAnchors(fromShape, toShape);
+            nx1 = anchors[0].x;
+            ny1 = anchors[0].y;
+            nx2 = anchors[1].x;
+            ny2 = anchors[1].y;
+        } else {
+            if (fromShape != null) {
+                Point2D.Double snapped = intersectShapeBoundary(fromShape, getShapeCenter(fromShape), new Point2D.Double(sel.x2, sel.y2));
+                if (snapped != null) {
+                    nx1 = snapped.x;
+                    ny1 = snapped.y;
+                }
+            }
+            if (toShape != null) {
+                Point2D.Double snapped = intersectShapeBoundary(toShape, getShapeCenter(toShape), new Point2D.Double(sel.x1, sel.y1));
+                if (snapped != null) {
+                    nx2 = snapped.x;
+                    ny2 = snapped.y;
+                }
+            }
+        }
+
+        Shape line = new Line2D.Double(nx1, ny1, nx2, ny2);
+        return new ShapeRecord(sel.tool, line, sel.color, sel.stroke, nx1, ny1, nx2, ny2,
+            sel.text, sel.font, sel.entityId, sel.localId, fromAnchor, toAnchor);
+    }
+
+    private void persistConnectorRecord(int index, ShapeRecord nr) {
+        if (nr == null) return;
+
+        if (nr.entityId != null && model != null) {
+            ReMoDeLEntity ent = model.get(nr.entityId);
+            if (ent != null) {
+                ReMoDeLEntity copy = ent.copy();
+                String fromEntityId = nr.anchorFromId != null ? findEntityIdByLocalId(nr.anchorFromId) : null;
+                String toEntityId = nr.anchorToId != null ? findEntityIdByLocalId(nr.anchorToId) : null;
+                copy.put("fromId", fromEntityId);
+                copy.put("toId", toEntityId);
+                copy.put("shapeType", nr.tool.name());
+                copy.put("manualPosition", fromEntityId == null || toEntityId == null);
+                copy.put("x1", (int) Math.round(nr.x1));
+                copy.put("y1", (int) Math.round(nr.y1));
+                copy.put("x2", (int) Math.round(nr.x2));
+                copy.put("y2", (int) Math.round(nr.y2));
+                if (nr.color != null) copy.put("colorRGB", nr.color.getRGB());
+                copy.put("strokeWidth", nr.stroke);
+                if (nr.text != null) copy.put("text", nr.text);
+                model.updateEntity(copy);
+            }
+        }
+
+        if (index >= 0 && index < shapes.size()) {
+            shapes.set(index, nr);
+        }
+    }
+
+    private ShapeRecord updateConnectorEndpointRecord(ShapeRecord sel, int endpoint, int x, int y) {
+        if (sel == null) return null;
+
+        String fromAnchor = sel.anchorFromId;
+        String toAnchor = sel.anchorToId;
+        double nx1 = sel.x1, ny1 = sel.y1, nx2 = sel.x2, ny2 = sel.y2;
+
+        int hitIdx = findAnchorTarget(x, y);
+        ShapeRecord hitShape = (hitIdx >= 0 && hitIdx < shapes.size()) ? shapes.get(hitIdx) : null;
+
+        if (endpoint == 0) {
+            nx1 = x;
+            ny1 = y;
+            fromAnchor = hitShape != null ? hitShape.localId : null;
+        } else {
+            nx2 = x;
+            ny2 = y;
+            toAnchor = hitShape != null ? hitShape.localId : null;
+        }
+
+        ShapeRecord fromShape = findShapeByLocalId(fromAnchor);
+        ShapeRecord toShape = findShapeByLocalId(toAnchor);
+        if (fromShape != null && toShape != null && fromShape != toShape) {
+            Point2D.Double[] anchors = computeConnectorAnchors(fromShape, toShape);
+            nx1 = anchors[0].x;
+            ny1 = anchors[0].y;
+            nx2 = anchors[1].x;
+            ny2 = anchors[1].y;
+        }
+
+        Shape line = new Line2D.Double(nx1, ny1, nx2, ny2);
+        ShapeRecord updated = new ShapeRecord(sel.tool, line, sel.color, sel.stroke, nx1, ny1, nx2, ny2,
+            sel.text, sel.font, sel.entityId, sel.localId, fromAnchor, toAnchor);
+        if (updated.entityId == null && updated.anchorFromId == null && updated.anchorToId == null) {
+            // no model-backed anchors: keep explicit coordinates for free connector editing
+            return new ShapeRecord(updated.tool, updated.shape, updated.color, updated.stroke,
+                updated.x1, updated.y1, updated.x2, updated.y2,
+                updated.text, updated.font, updated.entityId, updated.localId, null, null);
+        }
+        return updated;
+    }
+
+    private ShapeRecord createPreview(int x1, int y1, int x2, int y2) {
+        
+        Shape s = null;
+        Tool t = currentTool;
+        int rx = Math.min(x1, x2);
+        int ry = Math.min(y1, y2);
+        int rw = Math.abs(x2 - x1);
+        int rh = Math.abs(y2 - y1);
+        String text = null;
+        Font font = null;
+
+        switch (t) {
+
+            case LINE:
+            case AUTHORISATION:
+            case ARROW_FILLED:
+            case ARROW_DIAMOND:
+            case ARROW_OPEN:
+            case ARROW_EMPTY:
+            case IMPACT:
+            case REFERENCE:
+            case ENACTS:
+            case INITIAL_TRANSITION:
+            case FINAL_TRANSITION:
+                s = new Line2D.Double(x1, y1, x2, y2);
+                break;
+            case STATE:
+                s = new RoundRectangle2D.Double(rx, ry, rw, rh, rh, rh);
+                text = "State";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
+            case OVAL:
+                s = new Ellipse2D.Double(rx, ry, rw, rh);
+                text = "Task";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
+            case RECTANGLE:
+                s = new Rectangle2D.Double(rx, ry, rw, rh);
+                text = "Object";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
+            case OBJECT_TYPE:
+                s = new Rectangle2D.Double(rx, ry, rw, rh);
+                text = "Object\nattribute";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 4));
+                break;
+            case SYSTEM:
+                s = new Rectangle2D.Double(rx, ry, rw, rh);
+                text = "System";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
+            case ROUNDED_RECTANGLE:
+                s = new RoundRectangle2D.Double(rx, ry, rw, rh, Math.max(8, Math.min(rw, rh) / 4.0), Math.max(8, Math.min(rw, rh) / 4.0));
+                text = "Process";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
+            case BOUNDARY:
+                s = buildBoundaryShape(rx, ry, rw, rh);
+                text = "Boundary";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 4));
+                break;
+            case ACTOR:
+                s = buildActorShape(rx, ry, rw, rh);
+                text = "Actor";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 4));
+                break;
+            default:
+                s = new Line2D.Double(x1, y1, x2, y2);
+        }
+        return new ShapeRecord(t, s, drawColor, strokeWidth, x1, y1, x2, y2, text, font);
+    }
+
+    private ShapeRecord createRecordFromTool(Tool t, Color c, float sWidth, int x1, int y1, int x2, int y2) {
+
+        // helper to construct a new shape record with normalized coords
+        int rx = Math.min(x1, x2);
+        int ry = Math.min(y1, y2);
+        int rw = Math.abs(x2 - x1);
+        int rh = Math.abs(y2 - y1);
+        Shape s = null;
+        String text = null;
+        Font font = null;
+        
+        switch (t) {
+            case LINE:
+                text = "Association";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
+            case AUTHORISATION:
+                text = "Authorisation";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
+            case ENACTS:
+                s = new Line2D.Double(x1, y1, x2, y2);
+                text = "Enacts";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
+            case ARROW_FILLED:
+                text = "Data Flow";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
+            case ARROW_DIAMOND:
+                text = "Composition";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
+            case ARROW_OPEN:
+                text = "Transition";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
+            case REFERENCE:
+                s = new Line2D.Double(x1, y1, x2, y2);
+                text = getDefaultLabelForTool(Tool.REFERENCE);
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
+            case IMPACT:
+                s = new Line2D.Double(x1, y1, x2, y2);
+                text = "create";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
+            case ARROW_EMPTY:
+                s = new Line2D.Double(x1, y1, x2, y2);
+                text = "Generalisation";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
+            case STATE:
+                s = new RoundRectangle2D.Double(rx, ry, rw, rh, rh, rh);
+                text = "State";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
+            case OVAL:
+                s = new Ellipse2D.Double(rx, ry, rw, rh);
+                text = "Task";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
+            case RECTANGLE:
+                s = new Rectangle2D.Double(rx, ry, rw, rh);
+                text = "Object";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
+            case OBJECT_TYPE:
+                s = new Rectangle2D.Double(rx, ry, rw, rh);
+                text = "Object\nattribute";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 4));
+                break;
+            case SYSTEM:
+                s = new Rectangle2D.Double(rx, ry, rw, rh);
+                text = "System";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
+            case ROUNDED_RECTANGLE:
+                s = new RoundRectangle2D.Double(rx, ry, rw, rh, Math.max(8, Math.min(rw, rh) / 4.0), Math.max(8, Math.min(rw, rh) / 4.0));
+                text = "Process";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
+            case BOUNDARY:
+                s = buildBoundaryShape(rx, ry, rw, rh);
+                text = "Boundary";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 4));
+                break;
+            case ACTOR:
+                s = buildActorShape(rx, ry, rw, rh);
+                text = "Actor";
+                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 4));
+                break;
+            case FREEHAND:
+            default:
+                // fallback to a tiny line
+                s = new Line2D.Double(x1, y1, x2, y2);
+        }
+        return new ShapeRecord(t, s, c, sWidth, x1, y1, x2, y2, text, font);
+    }
+
+    private Shape buildActorShape(double x, double y, double w, double h) {
+        double width = Math.max(10, w);
+        double height = Math.max(16, h);
+        double headRadius = Math.max(4, Math.min(width, height) * 0.18);
+        double headCx = x + width / 2.0;
+        double headCy = y + headRadius + 1;
+
+        double bodyTopY = headCy + headRadius + 1;
+        double bodyBottomY = y + height * 0.68;
+        double armY = bodyTopY + (bodyBottomY - bodyTopY) * 0.35;
+        double legY = y + height - 2;
+
+        double armHalf = Math.max(6, width * 0.28);
+        double legHalf = Math.max(6, width * 0.24);
+
+        Path2D p = new Path2D.Double();
+        Ellipse2D head = new Ellipse2D.Double(headCx - headRadius, headCy - headRadius, headRadius * 2, headRadius * 2);
+        p.append(head, false);
+        p.moveTo(headCx, bodyTopY);
+        p.lineTo(headCx, bodyBottomY);
+        p.moveTo(headCx - armHalf, armY);
+        p.lineTo(headCx + armHalf, armY);
+        p.moveTo(headCx, bodyBottomY);
+        p.lineTo(headCx - legHalf, legY);
+        p.moveTo(headCx, bodyBottomY);
+        p.lineTo(headCx + legHalf, legY);
+        return p;
+    }
+
+    private Graphics2D getBufferGraphics() {
+        ensureBuffer();
+        Graphics2D g = buf.createGraphics();
+        g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        return g;
+    }
+
+    private Point2D.Double computeArrowBase(double x1, double y1, double x2, double y2, float stroke) {
+        double dx = x2 - x1, dy = y2 - y1;
+        double len = Math.hypot(dx, dy);
+        if (len < 1e-6) return new Point2D.Double(x2, y2);
+        double ux = dx / len, uy = dy / len;
+        double headLen = Math.max(8, 6 + stroke * 2); 
+        double bx = x2 - ux * headLen;
+        double by = y2 - uy * headLen;
+        return new Point2D.Double(bx, by);
+    }
+
+    private static class ConnectorCrossing {
+        final ShapeRecord top;
+        final Point2D.Double point;
+
+        ConnectorCrossing(ShapeRecord top, Point2D.Double point) {
+            this.top = top;
+            this.point = point;
+        }
+    }
+
+    private java.util.List<ConnectorCrossing> computeConnectorCrossings() {
+        java.util.List<Integer> connectorIdx = new ArrayList<>();
+        for (int i = 0; i < shapes.size(); i++) {
+            ShapeRecord r = shapes.get(i);
+            if (r != null && isConnectorTool(r.tool)) connectorIdx.add(i);
+        }
+
+        java.util.List<ConnectorCrossing> crossings = new ArrayList<>();
+        for (int a = 0; a < connectorIdx.size(); a++) {
+            int ia = connectorIdx.get(a);
+            ShapeRecord ra = shapes.get(ia);
+            for (int b = a + 1; b < connectorIdx.size(); b++) {
+                int ib = connectorIdx.get(b);
+                ShapeRecord rb = shapes.get(ib);
+
+                Point2D.Double p = segmentIntersectionPoint(ra.x1, ra.y1, ra.x2, ra.y2, rb.x1, rb.y1, rb.x2, rb.y2);
+                if (p == null) continue;
+                if (isNearConnectorEndpoint(ra, p, CROSSING_ENDPOINT_PADDING)
+                    || isNearConnectorEndpoint(rb, p, CROSSING_ENDPOINT_PADDING)) {
+                    continue;
+                }
+
+                // Later-drawn connector gets the bridge marker so overlaps are deterministic.
+                ShapeRecord top = ia > ib ? ra : rb;
+                crossings.add(new ConnectorCrossing(top, p));
+            }
+        }
+        return crossings;
+    }
+
+    private boolean isNearConnectorEndpoint(ShapeRecord r, Point2D p, double threshold) {
+        if (r == null || p == null) return false;
+        double t2 = threshold * threshold;
+        double d1 = p.distanceSq(r.x1, r.y1);
+        double d2 = p.distanceSq(r.x2, r.y2);
+        return d1 < t2 || d2 < t2;
+    }
+
+    private Point2D.Double segmentIntersectionPoint(
+        double x1, double y1, double x2, double y2,
+        double x3, double y3, double x4, double y4
+    ) {
+        double den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+        if (Math.abs(den) < 1e-9) return null;
+
+        double px = ((x1 * y2 - y1 * x2) * (x3 - x4) - (x1 - x2) * (x3 * y4 - y3 * x4)) / den;
+        double py = ((x1 * y2 - y1 * x2) * (y3 - y4) - (y1 - y2) * (x3 * y4 - y3 * x4)) / den;
+
+        if (!pointOnSegment(px, py, x1, y1, x2, y2) || !pointOnSegment(px, py, x3, y3, x4, y4)) {
+            return null;
+        }
+        return new Point2D.Double(px, py);
+    }
+
+    private boolean pointOnSegment(double px, double py, double ax, double ay, double bx, double by) {
+        double minX = Math.min(ax, bx) - 1e-6;
+        double maxX = Math.max(ax, bx) + 1e-6;
+        double minY = Math.min(ay, by) - 1e-6;
+        double maxY = Math.max(ay, by) + 1e-6;
+        return px >= minX && px <= maxX && py >= minY && py <= maxY;
+    }
+
+    private void drawConnectorBridge(Graphics2D g, ShapeRecord connector, Point2D p) {
+        if (connector == null || p == null) return;
+
+        double angle = Math.atan2(connector.y2 - connector.y1, connector.x2 - connector.x1);
+        double radius = Math.max(CROSSING_BRIDGE_RADIUS, connector.stroke * 2.4);
+
+        Graphics2D g2 = (Graphics2D) g.create();
+        g2.translate(p.getX(), p.getY());
+        g2.rotate(angle);
+
+        // Cut a small gap in the top connector, then draw a smooth bridge arc.
+        g2.setColor(getBackground());
+        g2.setStroke(new BasicStroke(connector.stroke + 2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+        g2.draw(new Line2D.Double(-radius, 0, radius, 0));
+
+        g2.setColor(connector.color != null ? connector.color : drawColor);
+        g2.setStroke(new BasicStroke(connector.stroke, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+        Arc2D bridge = new Arc2D.Double(-radius, -radius, radius * 2, radius * 2, 180, 180, Arc2D.OPEN);
+        g2.draw(bridge);
+        g2.dispose();
+    }
+
+    private void drawRecord(Graphics2D g, ShapeRecord r, boolean isPreview) {
+        Stroke prev = g.getStroke();
+        Color prevC = g.getColor();
+        g.setStroke(new BasicStroke(r.stroke, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+        g.setColor(r.color);
+
+        switch (r.tool) {
+            case FREEHAND:
+            case LINE:
+                g.draw(r.shape);
+                break;
+            case AUTHORISATION:
+                Stroke oldStroke = g.getStroke();
+                float[] dash = {8.0f, 4.0f};
+                g.setStroke(new BasicStroke(r.stroke, BasicStroke.CAP_BUTT, BasicStroke.JOIN_MITER, 10.0f, dash, 0.0f));
+                g.draw(r.shape);
+                g.setStroke(oldStroke);
+                break;
+            case ENACTS: {
+                g.draw(r.shape);
+                double rDot = Math.max(3.5, r.stroke + 2.0);
+                double cx = r.x1 - rDot;
+                double cy = r.y1 - rDot;
+                g.fill(new Ellipse2D.Double(cx, cy, rDot * 2, rDot * 2));
+                break;
+            }
+            case OVAL:
+            case RECTANGLE:
+            case ROUNDED_RECTANGLE: {
+                // Draw the shape border
+                g.draw(r.shape);
+                // Draw text label if present
+                if (r.text != null) {
+                    Rectangle2D bounds = r.shape.getBounds2D();
+                    Font f = r.font != null ? r.font : new Font("SansSerif", Font.PLAIN, 12);
+                    g.setFont(f);
+                    drawTextLayout(g, r.text, f, bounds, r.color != null ? r.color : g.getColor());
+                }
+                break;
+            }
+            case OBJECT_TYPE: {
+                drawObjectTypeBox(g, r);
+                break;
+            }
+            case SYSTEM: {
+                drawSystemBox(g, r);
+                break;
+            }
+            case BOUNDARY: {
+                drawBoundaryBox(g, r);
+                break;
+            }
+            case ACTOR: {
+                g.draw(r.shape);
+                if (r.text != null) {
+                    Rectangle2D bounds = r.shape.getBounds2D();
+                    Font f = r.font != null ? r.font : new Font("SansSerif", Font.PLAIN, 12);
+                    g.setFont(f);
+                    String label = r.text.split("\\R", 2)[0];
+                    FontMetrics fm = g.getFontMetrics(f);
+                    int textWidth = fm.stringWidth(label);
+                    float textX = (float) (bounds.getCenterX() - textWidth / 2.0);
+                    float textY = (float) (bounds.getY() - 4.0);
+                    g.setColor(r.color != null ? r.color : g.getColor());
+                    g.drawString(label, textX, textY);
+                }
+                break;
+            }
+            case ARROW_FILLED:
+            case ARROW_DIAMOND:
+            case ARROW_EMPTY:
+            case ARROW_OPEN:
+            case IMPACT:
+            case REFERENCE:
+            case INITIAL_TRANSITION:
+            case FINAL_TRANSITION: {
+                double tipX = r.x2;
+                double tipY = r.y2;
+
+                // For FINAL_TRANSITION, place the arrow tip before the circled X with a visible gap.
+                if (r.tool == Tool.FINAL_TRANSITION) {
+                    double circleRadius = Math.max(8, r.stroke * 2.5);
+                    double gap = Math.max(4, r.stroke * 1.2);
+                    double dx = r.x2 - r.x1;
+                    double dy = r.y2 - r.y1;
+                    double len = Math.hypot(dx, dy);
+                    if (len > 1e-6) {
+                        double ux = dx / len;
+                        double uy = dy / len;
+                        tipX = r.x2 - ux * (circleRadius + gap);
+                        tipY = r.y2 - uy * (circleRadius + gap);
+                    }
+                }
+
+                // compute base of arrow head and draw shaft only to that base
+                Point2D.Double baseAll = computeArrowBase(r.x1, r.y1, tipX, tipY, r.stroke);
+                
+                // For INITIAL_TRANSITION, adjust shaft start to account for filled circle
+                double shaftStartX = r.x1;
+                double shaftStartY = r.y1;
+                if (r.tool == Tool.INITIAL_TRANSITION) {
+                    double circleRadius = Math.max(6, r.stroke * 2);
+                    double dx = r.x2 - r.x1;
+                    double dy = r.y2 - r.y1;
+                    double len = Math.hypot(dx, dy);
+                    if (len > 1e-6) {
+                        double ux = dx / len;
+                        double uy = dy / len;
+                        shaftStartX = r.x1 + ux * circleRadius;
+                        shaftStartY = r.y1 + uy * circleRadius;
+                    }
+                }
+                
+                Line2D shaftAll = new Line2D.Double(shaftStartX, shaftStartY, baseAll.x, baseAll.y);
+                g.draw(shaftAll);
+                
+                // Draw start decoration for INITIAL_TRANSITION (filled circle)
+                if (r.tool == Tool.INITIAL_TRANSITION) {
+                    double circleRadius = Math.max(6, r.stroke * 2);
+                    g.fill(new Ellipse2D.Double(r.x1 - circleRadius, r.y1 - circleRadius, circleRadius * 2, circleRadius * 2));
+                }
+                
+                // draw head using the same stroke so geometry matches
+                drawArrowHead(g, r.x1, r.y1, tipX, tipY, r.tool);
+                
+                // Draw end decoration for FINAL_TRANSITION (circle with cross)
+                if (r.tool == Tool.FINAL_TRANSITION) {
+                    double circleRadius = Math.max(8, r.stroke * 2.5);
+                    g.draw(new Ellipse2D.Double(r.x2 - circleRadius, r.y2 - circleRadius, circleRadius * 2, circleRadius * 2));
+                    // Draw cross inside circle
+                    double crossSize = circleRadius * 0.6;
+                    g.draw(new Line2D.Double(r.x2 - crossSize, r.y2 - crossSize, r.x2 + crossSize, r.y2 + crossSize));
+                    g.draw(new Line2D.Double(r.x2 - crossSize, r.y2 + crossSize, r.x2 + crossSize, r.y2 - crossSize));
+                }
+                if (r.text != null && !r.text.isBlank()) {
+                    Font f = r.font != null ? r.font : new Font("SansSerif", Font.PLAIN, 12);
+                    g.setFont(f);
+                    if (r.tool == Tool.ARROW_OPEN || r.tool == Tool.ARROW_FILLED || r.tool == Tool.ARROW_EMPTY || r.tool == Tool.ARROW_DIAMOND 
+                        || r.tool == Tool.INITIAL_TRANSITION || r.tool == Tool.FINAL_TRANSITION) {
+                        drawTransitionLabel(g, r, f);
+                    } else if (r.tool == Tool.IMPACT || r.tool == Tool.REFERENCE) {
+                        drawReferenceLabel(g, r, f);
+                    }
+                }
+                break;
+            }
+            case STATE: {
+                g.draw(r.shape);
+                Rectangle2D bounds = r.shape.getBounds2D();
+                if (r.text != null) {
+                    Font f = r.font != null ? r.font : new Font("SansSerif", Font.PLAIN, 12);
+                    g.setFont(f);
+                    drawTextLayout(g, r.text, f, bounds, r.color != null ? r.color : g.getColor());
+                }
+                break;
+            }
+            case TEXT: {
+                // draw multi-line / wrapped text within the shape bounds
+                try {
+                    Rectangle2D bounds = r.shape.getBounds2D();
+                    if (r.text != null) {
+                        Font f = r.font != null ? r.font : g.getFont();
+                        g.setFont(f);
+                        drawTextLayout(g, r.text, f, bounds, r.color != null ? r.color : g.getColor());
+                    }
+                } catch (Exception ex) {
+                    // fallback: draw shape
+                    try { g.draw(r.shape); } catch (Exception ignore) {}
+                }
+                break;
+            }
+            default:
+                g.draw(r.shape);
+        }
+        g.setColor(prevC);
+        g.setStroke(prev);
+    }
+
+    @Override
+    protected void paintComponent(Graphics gg) {
+        super.paintComponent(gg);
+        ensureBuffer();
+        Graphics2D g = (Graphics2D) gg.create();
+        g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        g.drawImage(buf, 0, 0, this);
+
+        for (ConnectorCrossing crossing : computeConnectorCrossings()) {
+            drawConnectorBridge(g, crossing.top, crossing.point);
+        }
+
+        // draw preview on top
+        if (preview != null) {
+            g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            // semi-transparent preview
+            Composite prevComp = g.getComposite();
+            g.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 0.85f));
+            drawRecord(g, preview, true);
+            g.setComposite(prevComp);
+        }
+
+        // draw selection handles
+        if (selectedIndex >= 0 && selectedIndex < shapes.size()) {
+            ShapeRecord sel = shapes.get(selectedIndex);
+
+            g.setColor(Color.BLUE);
+            g.setStroke(new BasicStroke(1f));
+            g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g.draw(sel.shape);
+
+            Rectangle2D b = getShapeBounds(sel);
+            if (isConnectorTool(sel.tool)) {
+                double h = HANDLE_SIZE + 2;
+                Ellipse2D start = new Ellipse2D.Double(sel.x1 - h / 2.0, sel.y1 - h / 2.0, h, h);
+                Ellipse2D end = new Ellipse2D.Double(sel.x2 - h / 2.0, sel.y2 - h / 2.0, h, h);
+                g.setColor(Color.WHITE);
+                g.fill(start);
+                g.fill(end);
+                g.setColor(Color.BLUE);
+                g.draw(start);
+                g.draw(end);
+            } else if (b != null) {
+                double hx = b.getX(), hy = b.getY(), hw = b.getWidth(), hh = b.getHeight();
+                double mx = hx + hw / 2.0, my = hy + hh / 2.0;
+                double edgeHandle = Math.max(8, HANDLE_SIZE - 2);
+                Rectangle2D[] handles = new Rectangle2D[] {
+                    new Rectangle2D.Double(hx - HANDLE_SIZE/2, hy - HANDLE_SIZE/2, HANDLE_SIZE, HANDLE_SIZE), // tl
+                    new Rectangle2D.Double(hx + hw - HANDLE_SIZE/2, hy - HANDLE_SIZE/2, HANDLE_SIZE, HANDLE_SIZE), // tr
+                    new Rectangle2D.Double(hx + hw - HANDLE_SIZE/2, hy + hh - HANDLE_SIZE/2, HANDLE_SIZE, HANDLE_SIZE), // br
+                    new Rectangle2D.Double(hx - HANDLE_SIZE/2, hy + hh - HANDLE_SIZE/2, HANDLE_SIZE, HANDLE_SIZE), // bl
+                    new Rectangle2D.Double(mx - edgeHandle/2, hy - edgeHandle/2, edgeHandle, edgeHandle), // top
+                    new Rectangle2D.Double(hx + hw - edgeHandle/2, my - edgeHandle/2, edgeHandle, edgeHandle), // right
+                    new Rectangle2D.Double(mx - edgeHandle/2, hy + hh - edgeHandle/2, edgeHandle, edgeHandle), // bottom
+                    new Rectangle2D.Double(hx - edgeHandle/2, my - edgeHandle/2, edgeHandle, edgeHandle) // left
+                };
+                g.setColor(Color.WHITE);
+                for (Rectangle2D h : handles) {
+                    g.fill(h);
+                    g.setColor(Color.BLUE);
+                    g.draw(h);
+                    g.setColor(Color.WHITE);
+                }
+            }
+        }
+        g.dispose();
+    }
+
+    private void drawArrowHead(Graphics2D g, double x1, double y1, double x2, double y2, Tool kind) {
+        // compute unit vector along line
+        double dx = x2 - x1, dy = y2 - y1;
+        double len = Math.hypot(dx, dy);
+        if (len < 1e-6) return;
+        double ux = dx / len, uy = dy / len;
+        double px = -uy, py = ux; // perp
+
+        double headLen = Math.max(8, 6 + strokeWidth * 2);
+        double headWidth = Math.max(12, 10 + strokeWidth * 1.5);
+
+        // base of head
+        double bx = x2 - ux * headLen;
+        double by = y2 - uy * headLen;
+
+        // two side points
+        double sx1 = bx + px * (headWidth / 2.0);
+        double sy1 = by + py * (headWidth / 2.0);
+        double sx2 = bx - px * (headWidth / 2.0);
+        double sy2 = by - py * (headWidth / 2.0);
+
+        Paint prev = g.getPaint();
+        switch (kind) {
+            case ARROW_FILLED: {
+                Path2D p = new Path2D.Double();
+                p.moveTo(x2, y2);
+                p.lineTo(sx1, sy1);
+                p.lineTo(sx2, sy2);
+                p.closePath();
+                g.fill(p);
+                break;
+            }
+            case ARROW_DIAMOND: {
+                // diamond center at bx - ux*(headLen/2)
+                double cx = bx - ux * (headLen / 2.0);
+                double cy = by - uy * (headLen / 2.0);
+                Path2D d = new Path2D.Double();
+                d.moveTo(x2, y2);
+                d.lineTo(sx1, sy1);
+                d.lineTo(cx, cy);
+                d.lineTo(sx2, sy2);
+                d.closePath();
+                g.draw(d);
+                break;
+            }
+            case ARROW_OPEN:
+            case INITIAL_TRANSITION:
+            case FINAL_TRANSITION:
+            case IMPACT:
+            case REFERENCE: {
+                // draw two lines forming open head
+                g.draw(new Line2D.Double(x2, y2, sx1, sy1));
+                g.draw(new Line2D.Double(x2, y2, sx2, sy2));
+                break;
+            }
+            case ARROW_EMPTY: {
+                Path2D tri = new Path2D.Double();
+                tri.moveTo(x2, y2);  
+                tri.lineTo(sx1, sy1); 
+                tri.lineTo(sx2, sy2); 
+                tri.closePath();
+                g.draw(tri); 
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    private void drawSystemBox(Graphics2D g, ShapeRecord r) {
+        Rectangle2D bounds = r.shape.getBounds2D();
+        double x = bounds.getX();
+        double y = bounds.getY();
+        double w = bounds.getWidth();
+        double h = bounds.getHeight();
+        double depth = Math.max(6, Math.min(w, h) * 0.18);
+
+        Rectangle2D front = new Rectangle2D.Double(x, y, w, h);
+        Polygon top = new Polygon();
+        top.addPoint((int) x, (int) y);
+        top.addPoint((int) (x + depth), (int) (y - depth));
+        top.addPoint((int) (x + w + depth), (int) (y - depth));
+        top.addPoint((int) (x + w), (int) y);
+
+        Polygon side = new Polygon();
+        side.addPoint((int) (x + w), (int) y);
+        side.addPoint((int) (x + w + depth), (int) (y - depth));
+        side.addPoint((int) (x + w + depth), (int) (y + h - depth));
+        side.addPoint((int) (x + w), (int) (y + h));
+
+        Color base = r.color != null ? r.color : g.getColor();
+        Color topShade = base.brighter();
+        Color sideShade = base.darker();
+
+        Paint prevPaint = g.getPaint();
+        g.setPaint(topShade);
+        g.fill(top);
+        g.setPaint(sideShade);
+        g.fill(side);
+        g.setPaint(prevPaint);
+
+        g.draw(front);
+        g.draw(top);
+        g.draw(side);
+
+        if (r.text != null) {
+            Font f = r.font != null ? r.font : new Font("SansSerif", Font.PLAIN, 12);
+            g.setFont(f);
+            drawTextLayout(g, r.text, f, front, base);
+        }
+    }
+
+    private void drawBoundaryBox(Graphics2D g, ShapeRecord r) {
+        Rectangle2D bounds = r.shape.getBounds2D();
+        double x = bounds.getX();
+        double y = bounds.getY();
+        double w = bounds.getWidth();
+        double h = bounds.getHeight();
+
+        String label = (r.text != null && !r.text.isBlank()) ? r.text.split("\\R", 2)[0].trim() : "Boundary";
+        Font baseFont = r.font != null ? r.font : new Font("SansSerif", Font.PLAIN, 11);
+
+        double minTabHeight = Math.max(18, h * 0.14);
+        double maxTabHeight = Math.max(minTabHeight, h * 0.30);
+        double tabHeight = Math.min(maxTabHeight, Math.max(minTabHeight, baseFont.getSize() + 10));
+
+        int minFontSize = 8;
+        Font fitFont = baseFont;
+        FontMetrics fitFm = g.getFontMetrics(fitFont);
+
+        double maxTabWidth = Math.max(24, w - 6);
+        while (fitFm.stringWidth(label) + 16 > maxTabWidth && fitFont.getSize() > minFontSize) {
+            fitFont = fitFont.deriveFont((float) (fitFont.getSize() - 1));
+            fitFm = g.getFontMetrics(fitFont);
+            tabHeight = Math.min(maxTabHeight, Math.max(minTabHeight, fitFont.getSize() + 10));
+        }
+
+        String drawLabel = label;
+        if (fitFm.stringWidth(drawLabel) + 16 > maxTabWidth) {
+            String ellipsis = "...";
+            int maxTextWidth = (int) Math.max(8, maxTabWidth - 16 - fitFm.stringWidth(ellipsis));
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < label.length(); i++) {
+                char ch = label.charAt(i);
+                if (fitFm.stringWidth(sb.toString() + ch) > maxTextWidth) break;
+                sb.append(ch);
+            }
+            drawLabel = sb.toString().trim() + ellipsis;
+        }
+
+        double textDrivenTabWidth = fitFm.stringWidth(drawLabel) + 16;
+        double tabWidth = Math.min(maxTabWidth, Math.max(Math.max(40, w * 0.25), textDrivenTabWidth));
+        
+        // Main rectangle
+        Rectangle2D mainRect = new Rectangle2D.Double(x, y + tabHeight, w, h - tabHeight);
+        
+        // Tab at top-left
+        Rectangle2D tab = new Rectangle2D.Double(x, y, tabWidth, tabHeight);
+        
+        Color base = r.color != null ? r.color : g.getColor();
+        g.setColor(base);
+        
+        // Draw main rectangle
+        g.draw(mainRect);
+        
+        // Draw tab
+        g.draw(tab);
+        
+        // Draw connecting line between tab and main rect (if they don't touch perfectly)
+        g.drawLine((int)(x + tabWidth), (int)(y + tabHeight), (int)x, (int)(y + tabHeight));
+        
+        // Draw text in tab area
+        g.setFont(fitFont);
+        FontMetrics fm = g.getFontMetrics(fitFont);
+        int textWidth = fm.stringWidth(drawLabel);
+        float textX = (float) (x + (tabWidth - textWidth) / 2.0);
+        float textY = (float) (y + (tabHeight - fm.getHeight()) / 2.0 + fm.getAscent());
+        g.setColor(base);
+        g.drawString(drawLabel, textX, textY);
+    }
+
+    private void drawAlignedConnectorLabel(Graphics2D g, ShapeRecord r, Font f, String[] lines, boolean underlineFirst) {
+        if (r == null || lines == null || lines.length == 0) return;
+
+        Graphics2D g2 = (Graphics2D) g.create();
+        g2.setFont(f);
+        FontMetrics fm = g2.getFontMetrics(f);
+
+        double dx = r.x2 - r.x1;
+        double dy = r.y2 - r.y1;
+        double len = Math.hypot(dx, dy);
+        if (len < 1e-6) {
+            g2.dispose();
+            return;
+        }
+
+        double angle = Math.atan2(dy, dx);
+        double nx = -dy / len;
+        double ny = dx / len;
+        if (angle > Math.PI / 2 || angle < -Math.PI / 2) {
+            angle += Math.PI;
+            nx = -nx;
+            ny = -ny;
+        }
+
+        double offset = Math.max(10.0, fm.getHeight() * 0.6);
+        double midX = (r.x1 + r.x2) / 2.0 + nx * offset;
+        double midY = (r.y1 + r.y2) / 2.0 + ny * offset;
+
+        g2.translate(midX, midY);
+        g2.rotate(angle);
+
+        int lineHeight = fm.getHeight();
+        float baseline = (float) (-(lines.length * lineHeight) / 2.0 + fm.getAscent());
+        for (int i = 0; i < lines.length; i++) {
+            String line = lines[i] != null ? lines[i].trim() : "";
+            if (line.isEmpty()) continue;
+            int lineWidth = fm.stringWidth(line);
+            float x = -lineWidth / 2.0f;
+            float y = baseline + i * lineHeight;
+            g2.drawString(line, x, y);
+            if (underlineFirst && i == 0) {
+                int underlineY = Math.round(y + 2);
+                g2.drawLine(Math.round(x), underlineY, Math.round(x + lineWidth), underlineY);
+            }
+        }
+        g2.dispose();
+    }
+
+    private void drawTransitionLabel(Graphics2D g, ShapeRecord r, Font f) {
+        if (r.text == null) return;
+        String text = r.text.trim();
+        if (text.isEmpty()) return;
+        drawAlignedConnectorLabel(g, r, f, new String[] { text }, false);
+    }
+
+    private void drawReferenceLabel(Graphics2D g, ShapeRecord r, Font f) {
+        if (r.text == null) return;
+        String[] lines = r.text.split("\\R");
+        String label = lines.length > 0 ? lines[0].trim() : "";
+        String qualifier = lines.length > 1 ? lines[1].trim() : "";
+
+        boolean underline = false;
+        if (r.tool == Tool.REFERENCE && label.startsWith("*")) {
+            underline = true;
+            label = label.substring(1).trim();
+        }
+
+        if (qualifier.isEmpty()) {
+            drawAlignedConnectorLabel(g, r, f, new String[] { label }, underline);
+        } else {
+            drawAlignedConnectorLabel(g, r, f, new String[] { label, qualifier }, underline);
+        }
+    }
+
+    private void drawObjectTypeBox(Graphics2D g, ShapeRecord r) {
+        Rectangle2D bounds = r.shape.getBounds2D();
+        double x = bounds.getX();
+        double y = bounds.getY();
+        double w = bounds.getWidth();
+        double h = bounds.getHeight();
+
+        Color base = r.color != null ? r.color : g.getColor();
+        g.setColor(base);
+
+        g.draw(bounds);
+
+        String text = r.text != null ? r.text : getDefaultLabelForTool(Tool.OBJECT_TYPE);
+        String[] lines = text.split("\\R");
+        String name = lines.length > 0 && !lines[0].isBlank() ? lines[0].trim() : "Object";
+
+        Font baseFont = r.font != null ? r.font : new Font("SansSerif", Font.PLAIN, 12);
+        Font nameFont = baseFont.deriveFont(Font.BOLD);
+        g.setFont(nameFont);
+        FontMetrics nameFm = g.getFontMetrics(nameFont);
+
+        int nameHeight = nameFm.getHeight() + 6;
+        int maxNameHeight = (int) Math.max(16, Math.min(h * 0.4, nameHeight));
+        int dividerY = (int) (y + maxNameHeight);
+
+        g.drawLine((int) x, dividerY, (int) (x + w), dividerY);
+
+        int nameWidth = nameFm.stringWidth(name);
+        float nameX = (float) (x + (w - nameWidth) / 2.0);
+        float nameY = (float) (y + (maxNameHeight - nameFm.getHeight()) / 2.0 + nameFm.getAscent());
+        g.drawString(name, nameX, nameY);
+
+        g.setFont(baseFont);
+        FontMetrics fm = g.getFontMetrics(baseFont);
+        float attrX = (float) (x + 6);
+        float attrY = dividerY + fm.getAscent() + 4;
+
+        for (int i = 1; i < lines.length; i++) {
+            String attr = lines[i].trim();
+            if (attr.isEmpty()) {
+                attrY += fm.getHeight();
+                continue;
+            }
+            boolean underline = false;
+            if (attr.startsWith("*")) {
+                underline = true;
+                attr = attr.substring(1).trim();
+            }
+            g.drawString(attr, attrX, attrY);
+            if (underline && !attr.isEmpty()) {
+                int textWidth = fm.stringWidth(attr);
+                int underlineY = (int) (attrY + 2);
+                g.drawLine((int) attrX, underlineY, (int) attrX + textWidth, underlineY);
+            }
+            attrY += fm.getHeight() + 2;
+            if (attrY > y + h - 4) break;
+        }
+    }
+
+    private Shape buildBoundaryShape(double x, double y, double w, double h) {
+        // For preview/selection purposes, return a composite path of rectangle + tab
+        double tabWidth = Math.min(80, w * 0.35);
+        double tabHeight = Math.max(20, h * 0.15);
+        
+        Path2D p = new Path2D.Double();
+        // Main rectangle
+        p.moveTo(x, y + tabHeight);
+        p.lineTo(x, y + h);
+        p.lineTo(x + w, y + h);
+        p.lineTo(x + w, y + tabHeight);
+        p.lineTo(x + tabWidth, y + tabHeight);
+        p.lineTo(x + tabWidth, y);
+        p.lineTo(x, y);
+        p.closePath();
+        
+        return p;
+    }
+
+
+    /**
+     * Draw text with simple word-wrapping inside the given bounds using FontMetrics.
+     * Text is horizontally centered within the bounds.
+     * This avoids dependencies on java.text.LineBreakMeasurer/TextLayout so it compiles
+     * cleanly in minimal module configurations.
+     */
+    private void drawTextLayout(Graphics2D g, String text, Font font, Rectangle2D bounds, Color color) {
+        if (text == null || text.isEmpty() || bounds == null) return;
+        g.setFont(font != null ? font : g.getFont());
+        g.setColor(color != null ? color : g.getColor());
+        FontMetrics fm = g.getFontMetrics(g.getFont());
+        int wrapWidth = Math.max(4, (int) bounds.getWidth() - 8);
+        float y = (float) (bounds.getY() + 4f) + fm.getAscent();
+
+        String[] paragraphs = text.split("\r?\n");
+        for (int p = 0; p < paragraphs.length; p++) {
+            String paragraph = paragraphs[p].trim();
+            if (paragraph.isEmpty()) {
+                y += fm.getHeight();
+                if (y > bounds.getY() + bounds.getHeight()) break;
+                continue;
+            }
+            String[] words = paragraph.split("\\s+");
+            StringBuilder line = new StringBuilder();
+            for (int i = 0; i < words.length; i++) {
+                String word = words[i];
+                String test = line.length() == 0 ? word : line + " " + word;
+                int w = fm.stringWidth(test);
+                if (w > wrapWidth && line.length() > 0) {
+                    // draw current line (centered)
+                    String lineStr = line.toString();
+                    int lineWidth = fm.stringWidth(lineStr);
+                    float x = (float) (bounds.getX() + (bounds.getWidth() - lineWidth) / 2.0);
+                    g.drawString(lineStr, x, y);
+                    y += fm.getHeight();
+                    if (y > bounds.getY() + bounds.getHeight()) return;
+                    line.setLength(0);
+                    line.append(word);
+                } else {
+                    if (line.length() > 0) line.append(' ');
+                    line.append(word);
+                }
+            }
+            if (line.length() > 0) {
+                // draw last line (centered)
+                String lineStr = line.toString();
+                int lineWidth = fm.stringWidth(lineStr);
+                float x = (float) (bounds.getX() + (bounds.getWidth() - lineWidth) / 2.0);
+                g.drawString(lineStr, x, y);
+                y += fm.getHeight();
+                if (y > bounds.getY() + bounds.getHeight()) return;
+            }
+            // add paragraph spacing
+            y += fm.getLeading();
+        }
+    }
+
+    public void clear() {
+        shapes.clear();
+        if (buf != null) {
+            Graphics2D g = buf.createGraphics();
+            g.setColor(Color.WHITE);
+            g.fillRect(0, 0, buf.getWidth(), buf.getHeight());
+            g.dispose();
+        }
+        selectedIndex = -1;
+        repaint();
+    }
+
+    public void copySelectedShape() {
+        if (selectedIndex < 0 || selectedIndex >= shapes.size()) return;
+        clipboardRecord = copyShapeRecord(shapes.get(selectedIndex));
+        pasteSerial = 0;
+        statusConsumer.accept("Copied");
+    }
+
+    public void cutSelectedShape() {
+        if (selectedIndex < 0 || selectedIndex >= shapes.size()) return;
+        copySelectedShape();
+        deleteSelectedShape();
+        statusConsumer.accept("Cut");
+    }
+
+    public void pasteClipboardShape() {
+        if (clipboardRecord == null) return;
+
+        pasteSerial++;
+        int offset = 20 * pasteSerial;
+        ShapeRecord pasted = createPastedRecord(clipboardRecord, offset, offset);
+        if (pasted == null) return;
+
+        if (model != null) {
+            ReMoDeLEntity ent = entityFromShape(pasted);
+            ent.setId(java.util.UUID.randomUUID().toString());
+            model.addEntity(ent);
+            SwingUtilities.invokeLater(() -> {
+                Integer idx = idToIndex.get(ent.getId());
+                if (idx != null) {
+                    selectedIndex = idx;
+                    repaint();
+                }
+            });
+        } else {
+            shapes.add(pasted);
+            selectedIndex = shapes.size() - 1;
+            redrawBuffer();
+            repaint();
+        }
+        statusConsumer.accept("Pasted");
+    }
+
+    private ShapeRecord createPastedRecord(ShapeRecord source, int dx, int dy) {
+        if (source == null) return null;
+
+        Shape moved;
+        if (source.tool == Tool.TEXT) {
+            moved = new Rectangle2D.Double(
+                Math.min(source.x1 + dx, source.x2 + dx),
+                Math.min(source.y1 + dy, source.y2 + dy),
+                Math.abs(source.x2 - source.x1),
+                Math.abs(source.y2 - source.y1)
+            );
+        } else {
+            moved = AffineTransform.getTranslateInstance(dx, dy).createTransformedShape(source.shape);
+        }
+
+        return new ShapeRecord(
+            source.tool,
+            moved,
+            source.color,
+            source.stroke,
+            source.x1 + dx,
+            source.y1 + dy,
+            source.x2 + dx,
+            source.y2 + dy,
+            source.text,
+            source.font,
+            null,
+            null,
+            null,
+            null
+        );
+    }
+
+    public void saveDrawing(File file) throws IOException {
+        if (file == null) throw new IllegalArgumentException("File cannot be null");
+        CanvasSnapshot snapshot = new CanvasSnapshot(new ArrayList<>(shapes));
+        try (ObjectOutputStream out = new ObjectOutputStream(new FileOutputStream(file))) {
+            out.writeObject(snapshot);
+            System.out.println("Drawing saved successfully.");
+        }
+    }
+
+    public void loadDrawing(File file) throws IOException, ClassNotFoundException {
+        if (file == null) throw new IllegalArgumentException("File cannot be null");
+        CanvasSnapshot snapshot;
+        try (ObjectInputStream in = new ObjectInputStream(new FileInputStream(file))) {
+            snapshot = (CanvasSnapshot) in.readObject();
+        }
+        setModel(null);
+        shapes.clear();
+        idToIndex.clear();
+        undoManager.discardAllEdits();
+        selectedIndex = -1;
+        preview = null;
+        if (snapshot != null && snapshot.shapes != null) {
+            shapes.addAll(snapshot.shapes);
+        }
+        redrawBuffer();
+        repaint();
+        updateUndoRedoState();
+    }
+
+    public void setDrawColor(Color c) {
+        if (c != null) drawColor = c;
+    }
+
+    public void setStrokeWidth(float w) {
+        strokeWidth = Math.max(1f, w);
+    }
+
+    public void setCurrentTool(Tool t) {
+        if (t != null) {
+            Tool old = this.currentTool;
+            this.currentTool = t;
+            // when switching to select, clear preview
+            if (t == Tool.SELECT || t == Tool.TEXT) preview = null;
+            // notify listeners so UI can update
+            firePropertyChange("currentTool", old, t);
+        }
+    }
+
+    // getter for current tool (used by UI)
+    public Tool getCurrentTool() {
+        return currentTool;
+    }
+
+    // getter for draw color so toolbar/text inserter can reuse it
+    public Color getDrawColor() {
+        return drawColor;
+    }
+
+    public void addStatusConsumer(Consumer<String> c) {
+        this.statusConsumer = c;
+    }
+
+     /**
++     * Insert a default-sized shape of the given tool at the center of the canvas.
++     * Uses the same ShapeRecord creation logic as dragging would.
++     */
+    public void addDefaultShape(Tool t) {
+
+        if (t == null) return;
+        int dw = Math.min(200, Math.max(40, getWidth() / 6));
+        int dh = Math.min(150, Math.max(30, getHeight() /10));
+        int x = Math.max(10, (getWidth() - dw) / 2);
+        int y = Math.max(10, (getHeight() - dh) / 2);
+
+        ShapeRecord r = createRecordFromTool(t, drawColor, strokeWidth, x, y, x + dw, y + dh);
+        if (r != null) {
+            shapes.add(r);
+            redrawBuffer();
+            repaint();
+        }
+    }
+
+    /**
+     * Add a default text item centered on the canvas.
+     */
+    public void addDefaultText(String text) {
+        if (text == null || text.isEmpty()) text = "Text";
+        int dw = Math.min(300, Math.max(80, getWidth() / 6));
+        int dh = Math.min(120, Math.max(20, getHeight() /12));
+        int x = Math.max(10, (getWidth() - dw) / 2);
+        int y = Math.max(10, (getHeight() - dh) / 2);
+
+        // Create a text shape (using a rectangle as placeholder)
+        Font f = new Font("SansSerif", Font.PLAIN, Math.max(12, dh / 2));
+        ShapeRecord r = ShapeRecord.textRecord(text, f, drawColor, strokeWidth, x, y, dw,  dh);
+        shapes.add(r);
+        redrawBuffer();
+        repaint();
+    }
+
+    /**
+     * Add text at explicit bounds (x,y,w,h).
+     */
+    public void addTextAt(String text, int x, int y, int w, int h) {
+        if (text == null) text = "";
+        Font f = new Font("SansSerif", Font.PLAIN, Math.max(12, h / 2));
+        // If a model is present, create a model entity and let the model listener populate the canvas.
+        if (model != null) {
+            ReMoDeLEntity ent = new ReMoDeLEntity();
+            ent.setType("text");
+            ent.put("x1", x);
+            ent.put("y1", y);
+            ent.put("x2", x + w);
+            ent.put("y2", y + h);
+            ent.put("text", text);
+            ent.put("fontName", f.getName());
+            ent.put("fontStyle", f.getStyle());
+            ent.put("fontSize", f.getSize());
+            ent.put("colorRGB", drawColor.getRGB());
+            // add to model (will trigger listener to update canvas)
+            model.addEntity(ent);
+            // find resulting index and register undo
+            Integer idx = idToIndex.get(ent.getId());
+            if (idx == null) {
+                // fallback: try to locate the entity in shapes
+                for (int i = 0; i < shapes.size(); i++) {
+                    ShapeRecord rr = shapes.get(i);
+                    if (ent.getId().equals(rr.entityId)) { idx = i; break; }
+                }
+            }
+            if (idx != null) {
+                addUndoableEdit(new TextCreateEdit(idx, copyShapeRecord(shapes.get(idx)), ent.copy()));
+            }
+        } else {
+            ShapeRecord r = ShapeRecord.textRecord(text, f, drawColor, strokeWidth, x, y, w, h);
+            shapes.add(r);
+            // create undoable edit for text creation
+            int idx = shapes.size() - 1;
+            addUndoableEdit(new TextCreateEdit(idx, copyShapeRecord(r)));
+            redrawBuffer();
+            repaint();
+        }
+    }
+
+    /**
+     * Start inline editing of a text shape at given index. Creates a JTextField overlay.
+     */
+    private void startEditingText(int index) {
+        if (index < 0 || index >= shapes.size()) return;
+        ShapeRecord sel = shapes.get(index);
+        if (sel.tool != Tool.TEXT) return;
+        selectedIndex = index;
+
+        Rectangle2D b = getShapeBounds(sel);
+        if (b == null) return;
+
+        final JTextArea ta = new JTextArea(sel.text != null ? sel.text : "");
+        ta.setLineWrap(true);
+        ta.setWrapStyleWord(true);
+        ta.setOpaque(true);
+        ta.setBackground(Color.WHITE);
+        ta.setForeground(sel.color != null ? sel.color : drawColor);
+        ta.setFont(sel.font != null ? sel.font : getFont());
+        JScrollPane sp = new JScrollPane(ta);
+        sp.setBounds((int) b.getX(), (int) b.getY(), Math.max(40, (int) b.getWidth()), Math.max(24, (int) b.getHeight()));
+        this.add(sp);
+        this.revalidate();
+        this.repaint();
+        ta.requestFocusInWindow();
+        ta.selectAll();
+
+        Runnable finish = () -> {
+            String txt = ta.getText();
+            DrawingCanvas.this.remove(sp);
+            // update the selected text record
+            updateSelectedText(txt, ta.getFont(), ta.getForeground());
+            DrawingCanvas.this.revalidate();
+            DrawingCanvas.this.repaint();
+        };
+
+        Runnable cancel = () -> {
+            DrawingCanvas.this.remove(sp);
+            DrawingCanvas.this.revalidate();
+            DrawingCanvas.this.repaint();
+        };
+
+        // Commit on Ctrl+Enter
+        ta.getInputMap(JComponent.WHEN_FOCUSED).put(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, InputEvent.CTRL_DOWN_MASK), "commit");
+        ta.getActionMap().put("commit", new AbstractAction() {
+            @Override public void actionPerformed(ActionEvent e) { finish.run(); }
+        });
+        // Cancel on Escape
+        ta.getInputMap(JComponent.WHEN_FOCUSED).put(KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), "cancel");
+        ta.getActionMap().put("cancel", new AbstractAction() {
+            @Override public void actionPerformed(ActionEvent e) { cancel.run(); }
+        });
+
+        ta.addFocusListener(new FocusAdapter() {
+            @Override
+            public void focusLost(FocusEvent e) {
+                finish.run();
+            }
+        });
+    }
+
+    /**
+     * Delete the currently selected shape, if any. 
+    */
+    public void deleteSelectedShape() {
+        if (selectedIndex >= 0 && selectedIndex < shapes.size()) {
+            ShapeRecord sel = shapes.get(selectedIndex);
+            if (sel != null && sel.entityId != null && model != null) {
+                model.removeEntity(sel.entityId);
+            } else {
+                shapes.remove(selectedIndex);
+                redrawBuffer();
+                repaint();
+            }
+            selectedIndex = -1;
+        }
+    }
+
+    /**
+     * Update text/font/color/size for the selected record if it's a TEXT item.
+     */
+    public void updateSelectedText(String newText, Font newFont, Color newColor) {
+        if (selectedIndex >= 0 && selectedIndex < shapes.size()) {
+            ShapeRecord sel = shapes.get(selectedIndex);
+            if (sel.tool != Tool.TEXT) return;
+            // keep bounding rect; update text/font/color
+            ShapeRecord nr = new ShapeRecord(Tool.TEXT,
+               new Rectangle2D.Double(sel.x1, sel.y1, sel.x2 - sel.x1, sel.y2 - sel.y1),
+               newColor != null ? newColor : sel.color,
+               sel.stroke,
+               sel.x1, sel.y1, sel.x2, sel.y2,
+               newText != null ? newText : sel.text,
+                    newFont != null ? newFont : sel.font,
+                    sel.entityId,
+                    sel.localId,
+                    sel.anchorFromId,
+                    sel.anchorToId);
+            // register undo: before -> after. If the shape is backed by a model entity, update the model
+            ShapeRecord before = copyShapeRecord(sel);
+            ShapeRecord after = copyShapeRecord(nr);
+            if (sel.entityId != null && model != null) {
+                // apply via model (listener will rebuild shapes)
+                model.updateEntity(entityFromShape(after));
+            } else {
+                shapes.set(selectedIndex, nr);
+                redrawBuffer();
+                repaint();
+            }
+            addUndoableEdit(new TextEdit(selectedIndex, before, after));
+        }
+    }
+
+     /**
+     * Register an UndoableEdit for the last operation.
+     * Call this from your controller/operations whenever an action should be undoable.
+     */
+    public void addUndoableEdit(UndoableEdit edit) {
+        if (edit == null) return;
+        undoManager.addEdit(edit);
+        updateUndoRedoState();
+    }
+
+    public void undo() {
+        if (undoManager.canUndo()) {
+            undoManager.undo();
+            updateUndoRedoState();
+            repaint();
+        }
+    }
+
+    public void redo() {
+        if (undoManager.canRedo()) {
+            undoManager.redo();
+            updateUndoRedoState();
+            repaint();
+        }
+    }
+
+    public boolean canUndo() {
+        return undoManager.canUndo();
+    }
+
+    public boolean canRedo() {
+        return undoManager.canRedo();
+    }
+
+    private void updateUndoRedoState() {
+        // fire property changes so UI can enable/disable menu/buttons
+        boolean canU = undoManager.canUndo();
+        boolean canR = undoManager.canRedo();
+        firePropertyChange("canUndo", !canU, canU);
+        firePropertyChange("canRedo", !canR, canR);
+    }
+}
