@@ -2,7 +2,7 @@
 
 VisualEditor is a Java Swing desktop application for creating and editing μML-inspired diagrams across multiple model views.
 
-It supports interactive drawing, editing, model-aware tool palettes, and export to JSON, XML, and ReMoDeL model files.
+It supports interactive drawing, editing, model-aware tool palettes, and export to JSON, XML, and ReMoDeL `.mod` model files.
 
 ## Features
 
@@ -18,7 +18,7 @@ It supports interactive drawing, editing, model-aware tool palettes, and export 
 - Export model snapshots as:
   - .json
   - .xml
-  - .remodel (model-instance export)
+  - .mod (model-instance export)
 - Undo/redo support
 - Copy/cut/paste support
 
@@ -100,11 +100,11 @@ java --module-path out -m VisualEditor/com.example.swingapp.app.Main
 4. Use the File menu to:
    - create a new diagram
    - save/open drawing snapshots (.ser)
-   - export to .json, .xml, or .remodel
+  - export to .json, .xml, or .mod
 
 ## Export Notes
 
-- `.remodel` export writes model-instance output.
+- `.mod` export writes model-instance output.
 - Exported content is generated from the current in-memory diagram model.
 
 ## Architecture Notes

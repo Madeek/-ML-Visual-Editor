@@ -1,0 +1,23 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Compile VisualEditor module",
+            "type": "shell",
+            "command": "javac",
+            "args": [
+                "-d",
+                "out",
+                "--module-source-path",
+                "src",
+                "-m",
+                "VisualEditor"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true 
+            },
+            "problemMatcher": []
+        }
+    ]
+}

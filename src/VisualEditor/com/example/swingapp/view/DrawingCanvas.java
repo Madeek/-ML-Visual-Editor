@@ -103,9 +103,17 @@ public class DrawingCanvas extends JComponent {
             if (!isConnectorEntity(e)) continue;
             ShapeRecord r = shapeFromConnector(e, entityIndex);
             if (r != null) {
-                idToIndex.put(e.getId(), shapes.size());
                 shapes.add(r);
             }
+        }
+
+        // Re-sort: larger shapes behind smaller ones, connectors always on top.
+        // Then rebuild idToIndex with the new positions.
+        sortShapesByArea();
+        idToIndex.clear();
+        for (int i = 0; i < shapes.size(); i++) {
+            ShapeRecord r = shapes.get(i);
+            if (r.entityId != null) idToIndex.put(r.entityId, i);
         }
 
         redrawBuffer();
@@ -121,6 +129,22 @@ public class DrawingCanvas extends JComponent {
             || t == Tool.INITIAL_TRANSITION || t == Tool.FINAL_TRANSITION
             || t == Tool.ARROW_DIAMOND || t == Tool.ARROW_OPEN || t == Tool.IMPACT
             || t == Tool.REFERENCE || t == Tool.ENACTS;
+    }
+
+    private boolean isTransitionTool(Tool t) {
+        return t == Tool.ARROW_OPEN || t == Tool.INITIAL_TRANSITION || t == Tool.FINAL_TRANSITION;
+    }
+
+    private boolean isSelfLoopTransition(Tool tool, ShapeRecord fromShape, ShapeRecord toShape) {
+        if (!isTransitionTool(tool) || fromShape == null || toShape == null) return false;
+        if (fromShape.localId == null || toShape.localId == null) return false;
+        return fromShape.localId.equals(toShape.localId);
+    }
+
+    private boolean isSelfLoopTransition(ShapeRecord r) {
+        if (r == null || !isTransitionTool(r.tool)) return false;
+        if (r.anchorFromId == null || r.anchorToId == null) return false;
+        return r.anchorFromId.equals(r.anchorToId);
     }
 
     private String getConnectorLabel(Tool tool, String existingText) {
@@ -167,11 +191,15 @@ public class DrawingCanvas extends JComponent {
             ShapeRecord from = findShapeByLocalId(r.anchorFromId);
             ShapeRecord to = findShapeByLocalId(r.anchorToId);
             if (from == null || to == null) continue;
-            Point2D.Double[] anchors = computeConnectorAnchors(from, to);
+                Point2D.Double[] anchors = isSelfLoopTransition(r.tool, from, to)
+                    ? computeSelfLoopAnchors(from)
+                    : computeConnectorAnchors(from, to);
             Point2D.Double start = anchors[0];
             Point2D.Double end = anchors[1];
-            Shape line = new Line2D.Double(start.x, start.y, end.x, end.y);
-            ShapeRecord updated = new ShapeRecord(r.tool, line, r.color, r.stroke, start.x, start.y, end.x, end.y,
+                Shape connectorShape = isSelfLoopTransition(r.tool, from, to)
+                    ? buildSelfLoopArc(from, start, end)
+                    : new Line2D.Double(start.x, start.y, end.x, end.y);
+                ShapeRecord updated = new ShapeRecord(r.tool, connectorShape, r.color, r.stroke, start.x, start.y, end.x, end.y,
                     r.text, r.font, r.entityId, r.localId, r.anchorFromId, r.anchorToId);
             shapes.set(i, updated);
         }
@@ -254,7 +282,9 @@ public class DrawingCanvas extends JComponent {
             }
         }
 
-        Point2D.Double[] anchors = computeConnectorAnchors(fromShape, toShape);
+        Point2D.Double[] anchors = isSelfLoopTransition(tool, fromShape, toShape)
+            ? computeSelfLoopAnchors(fromShape)
+            : computeConnectorAnchors(fromShape, toShape);
         Point2D.Double start = anchors[0];
         Point2D.Double end = anchors[1];
 
@@ -264,8 +294,10 @@ public class DrawingCanvas extends JComponent {
 
         String text = connector.get("text") instanceof String ? (String) connector.get("text") : null;
         text = getConnectorLabel(tool, text);
-        Shape line = new Line2D.Double(start.x, start.y, end.x, end.y);
-        return new ShapeRecord(tool, line, c, sWidth, start.x, start.y, end.x, end.y, text, null,
+        Shape connectorShape = isSelfLoopTransition(tool, fromShape, toShape)
+            ? buildSelfLoopArc(fromShape, start, end)
+            : new Line2D.Double(start.x, start.y, end.x, end.y);
+        return new ShapeRecord(tool, connectorShape, c, sWidth, start.x, start.y, end.x, end.y, text, null,
             connector.getId(), connector.getId(), fromShape.localId, toShape.localId);
     }
 
@@ -279,6 +311,43 @@ public class DrawingCanvas extends JComponent {
         if (start == null) start = fromCenter;
         if (end == null) end = toCenter;
         return new Point2D.Double[] { start, end };
+    }
+
+    private Point2D.Double[] computeSelfLoopAnchors(ShapeRecord shape) {
+        Rectangle2D bounds = shape.shape.getBounds2D();
+        Point2D.Double center = getShapeCenter(shape);
+
+        double dx = Math.max(20.0, bounds.getWidth() * 1.2);
+        double dy = Math.max(20.0, bounds.getHeight() * 1.2);
+
+        Point2D.Double towardRight = new Point2D.Double(center.x + dx, center.y);
+        Point2D.Double towardBottom = new Point2D.Double(center.x, center.y + dy);
+
+        Point2D.Double start = intersectShapeBoundary(shape, center, towardRight);
+        Point2D.Double end = intersectShapeBoundary(shape, center, towardBottom);
+
+        if (start == null) {
+            start = new Point2D.Double(bounds.getMaxX(), bounds.getCenterY());
+        }
+        if (end == null) {
+            end = new Point2D.Double(bounds.getCenterX(), bounds.getMaxY());
+        }
+        return new Point2D.Double[] { start, end };
+    }
+
+    private Shape buildSelfLoopArc(ShapeRecord shape, Point2D.Double start, Point2D.Double end) {
+        // Build a clean anchor-locked 3/4 ellipse:
+        // start at right-edge anchor, sweep clockwise, end at bottom-edge anchor.
+        double rx = Math.max(8.0, Math.abs(start.x - end.x));
+        double ry = Math.max(8.0, Math.abs(end.y - start.y));
+
+        // Place ellipse center so start is the top of the ellipse and end is the left side.
+        double cx = start.x;
+        double cy = end.y;
+
+        double x = cx - rx;
+        double y = cy - ry;
+        return new Arc2D.Double(x, y, rx * 2.0, ry * 2.0, 90.0, -270.0, Arc2D.OPEN);
     }
 
     private Point2D.Double getShapeCenter(ShapeRecord r) {
@@ -296,6 +365,7 @@ public class DrawingCanvas extends JComponent {
         if (Math.abs(dx) < 1e-6 && Math.abs(dy) < 1e-6) return new Point2D.Double(from.x, from.y);
 
         if (r.tool == Tool.OVAL) {
+            // Ellipse: solve parametric intersection
             double rx = b.getWidth() / 2.0;
             double ry = b.getHeight() / 2.0;
             if (rx <= 0 || ry <= 0) return new Point2D.Double(from.x, from.y);
@@ -357,9 +427,8 @@ public class DrawingCanvas extends JComponent {
             String txt = e.get("text") instanceof String ? (String)e.get("text") : "";
             String fontName = e.get("fontName") instanceof String ? (String)e.get("fontName") : "SansSerif";
             int fontStyle = e.get("fontStyle") instanceof Number ? ((Number)e.get("fontStyle")).intValue() : Font.PLAIN;
-            int fontSize = e.get("fontSize") instanceof Number ? ((Number)e.get("fontSize")).intValue() : Math.max(12, (y2 - y1) / 2);
             int rgb = e.get("colorRGB") instanceof Number ? ((Number)e.get("colorRGB")).intValue() : Color.BLACK.getRGB();
-            Font f = new Font(fontName, fontStyle, fontSize);
+            Font f = normalizeTextFont(new Font(fontName, fontStyle, DEFAULT_TEXT_FONT_SIZE));
             Color c = new Color(rgb, true);
             int w = Math.max(4, x2 - x1);
             int h = Math.max(4, y2 - y1);
@@ -429,11 +498,10 @@ public class DrawingCanvas extends JComponent {
             ent.put("x2", (int) Math.round(r.x2));
             ent.put("y2", (int) Math.round(r.y2));
             ent.put("text", r.text != null ? r.text : "");
-            if (r.font != null) {
-                ent.put("fontName", r.font.getName());
-                ent.put("fontStyle", r.font.getStyle());
-                ent.put("fontSize", r.font.getSize());
-            }
+            Font font = normalizeTextFont(r.font);
+            ent.put("fontName", font.getName());
+            ent.put("fontStyle", font.getStyle());
+            ent.put("fontSize", font.getSize());
             if (r.color != null) ent.put("colorRGB", r.color.getRGB());
             return ent;
         }
@@ -590,10 +658,16 @@ public class DrawingCanvas extends JComponent {
 
     // tools
     public enum Tool {
-        SELECT, DELETE, FREEHAND, LINE,
-        ARROW_FILLED, ARROW_EMPTY, ARROW_DIAMOND, ARROW_OPEN, IMPACT, REFERENCE, ENACTS,
+        SELECT, DELETE, FREEHAND, 
+        LINE,                   // General association
+        ARROW_FILLED,           // Dataflow (Task Model)
+        ARROW_EMPTY,            // Generalisation
+        ARROW_DIAMOND,          // Composition
+        ARROW_OPEN,             // Event/Transition
+        IMPACT, REFERENCE, ENACTS,
         OVAL, RECTANGLE, ROUNDED_RECTANGLE, BOUNDARY, OBJECT_TYPE,
-        TEXT, STATE, ACTOR, SYSTEM, AUTHORISATION, INITIAL_TRANSITION, FINAL_TRANSITION
+        TEXT, STATE, ACTOR, SYSTEM, AUTHORISATION, 
+        INITIAL_TRANSITION, FINAL_TRANSITION
     }
     private Tool currentTool = Tool.SELECT;
 
@@ -633,6 +707,7 @@ public class DrawingCanvas extends JComponent {
             }
         }
 
+        // Then: add connectors, resolving anchor references
         for (ShapeRecord r : shapes) {
             if (r == null || !isConnectorTool(r.tool)) continue;
             String fromId = localToEntity.get(r.anchorFromId);
@@ -684,6 +759,32 @@ public class DrawingCanvas extends JComponent {
     private static final int HANDLE_HIT_MARGIN = 6;
     private static final double CROSSING_ENDPOINT_PADDING = 12.0;
     private static final double CROSSING_BRIDGE_RADIUS = 8.0;
+    private static final int ENTITY_DEFAULT_WIDTH = 300;
+    private static final int ENTITY_DEFAULT_HEIGHT = 120;
+    private static final int ACTOR_DEFAULT_WIDTH = 100;
+    private static final int ACTOR_DEFAULT_HEIGHT = 130;
+    private static final String DEFAULT_TEXT_FONT_NAME = "SansSerif";
+    private static final int DEFAULT_TEXT_FONT_SIZE = 30;
+
+    private Font defaultTextFont() {
+        return new Font(DEFAULT_TEXT_FONT_NAME, Font.PLAIN, DEFAULT_TEXT_FONT_SIZE);
+    }
+
+    private Font normalizeTextFont(Font source) {
+        if (source == null) return defaultTextFont();
+        return new Font(source.getName(), source.getStyle(), DEFAULT_TEXT_FONT_SIZE);
+    }
+
+    // All non-connector entities except Actor/Boundary use constrained sizing.
+    private boolean isConstrainedSizeTool(Tool t) {
+        return t != null && !isConnectorTool(t) && t != Tool.ACTOR && t != Tool.BOUNDARY;
+    }
+
+    // Constrained entities have a minimum default size and may grow horizontally.
+    private int[] enforceDefaultSize(Tool tool, int width, int height) {
+        if (!isConstrainedSizeTool(tool)) return new int[] { width, height };
+        return new int[] { Math.max(width, ENTITY_DEFAULT_WIDTH), ENTITY_DEFAULT_HEIGHT };
+    }
 
     public DrawingCanvas() {
         setPreferredSize(new Dimension(1600, 1200));
@@ -849,6 +950,8 @@ public class DrawingCanvas extends JComponent {
                 }
 
                 if (currentTool == Tool.SELECT) {
+                    // Select mode should never create drawing previews.
+                    preview = null;
                     // hit-test shapes from top-most to bottom
                     int hit = hitTest(lastX, lastY);
                     if (hit >= 0) {
@@ -861,9 +964,10 @@ public class DrawingCanvas extends JComponent {
                                 return;
                             }
                                 // Shape items (RECTANGLE, OVAL, ROUNDED_RECTANGLE, STATE, ACTOR, SYSTEM) get label editing
-                            else if (sr.tool == Tool.RECTANGLE || sr.tool == Tool.OVAL || 
+                                else if (sr.tool == Tool.RECTANGLE || sr.tool == Tool.OVAL || 
                                     sr.tool == Tool.ROUNDED_RECTANGLE || sr.tool == Tool.STATE
-                                    || sr.tool == Tool.ACTOR || sr.tool == Tool.SYSTEM) {
+                                    || sr.tool == Tool.ACTOR || sr.tool == Tool.SYSTEM
+                                    || sr.tool == Tool.BOUNDARY) {
                                 startEditingShapeLabel(hit);
                                 return;
                             } else if (sr.tool == Tool.OBJECT_TYPE) {
@@ -890,12 +994,18 @@ public class DrawingCanvas extends JComponent {
                                 draggingMove = true;
                             }
                         } else {
-                            Rectangle2D bounds = getShapeBounds(selected);
-                            activeHandle = handleHit(bounds, lastX, lastY);
-                            if (activeHandle >= 0) {
-                                resizing = true;
-                            } else {
+                            if (selected.tool == Tool.ACTOR || isConstrainedSizeTool(selected.tool)) {
+                                activeHandle = -1;
+                                resizing = false;
                                 draggingMove = true;
+                            } else {
+                                Rectangle2D bounds = getShapeBounds(selected);
+                                activeHandle = handleHit(bounds, lastX, lastY);
+                                if (activeHandle >= 0) {
+                                    resizing = true;
+                                } else {
+                                    draggingMove = true;
+                                }
                             }
                         }
                         // start a grouped move/resize edit: capture the original record
@@ -909,8 +1019,8 @@ public class DrawingCanvas extends JComponent {
                     }
                 }
 
-                // other drawing tools: set preview (but TEXT uses separate placer and shouldn't show preview)
-                if (currentTool != Tool.TEXT) {
+                // only drawing tools should set a preview (not SELECT/TEXT)
+                if (currentTool != Tool.TEXT && currentTool != Tool.SELECT) {
                     preview = createPreview(lastX, lastY, lastX, lastY);
                 } else {
                     preview = null;
@@ -1017,9 +1127,13 @@ public class DrawingCanvas extends JComponent {
                             redrawBuffer();
                             repaint();
                         } else if (resizing) {
-                            // compute new bounds using which corner is dragged
-                            Rectangle2D b = getShapeBounds(sel);
-                            double x1 = b.getX(), y1 = b.getY(), x2 = b.getX() + b.getWidth(), y2 = b.getY() + b.getHeight();
+                            // compute new bounds using logical coords, not rendered shape bounds.
+                            // Actor geometry has fixed minimum limb extents, so rendered bounds can drift
+                            // from the drag box and make resize feel speed-dependent.
+                            double x1 = Math.min(sel.x1, sel.x2);
+                            double y1 = Math.min(sel.y1, sel.y2);
+                            double x2 = Math.max(sel.x1, sel.x2);
+                            double y2 = Math.max(sel.y1, sel.y2);
                             switch (activeHandle) {
                                 case 0: // top-left
                                     x1 = x; y1 = y;
@@ -1065,13 +1179,16 @@ public class DrawingCanvas extends JComponent {
                             } else {
                                 ShapeRecord nr = createRecordFromTool(sel.tool, sel.color, sel.stroke, (int)x1, (int)y1, (int)x2, (int)y2);
                                 if (nr != null) {
+                                    String keptText = sel.text != null ? sel.text : nr.text;
+                                    Font keptFont = normalizeTextFont(sel.font != null ? sel.font : nr.font);
                                     if (sel.entityId != null && model != null) {
                                         // preserve entity id
-                                        ShapeRecord withId = new ShapeRecord(nr.tool, nr.shape, nr.color, nr.stroke, nr.x1, nr.y1, nr.x2, nr.y2, nr.text, nr.font, sel.entityId);
+                                        ShapeRecord withId = new ShapeRecord(nr.tool, nr.shape, nr.color, nr.stroke,
+                                                nr.x1, nr.y1, nr.x2, nr.y2, keptText, keptFont, sel.entityId);
                                         model.updateEntity(entityFromShape(withId));
                                     } else {
                                         ShapeRecord withId = new ShapeRecord(nr.tool, nr.shape, nr.color, nr.stroke, nr.x1, nr.y1, nr.x2, nr.y2,
-                                                nr.text, nr.font, sel.entityId, sel.localId, sel.anchorFromId, sel.anchorToId);
+                                                keptText, keptFont, sel.entityId, sel.localId, sel.anchorFromId, sel.anchorToId);
                                         shapes.set(selectedIndex, withId);
                                         reanchorConnectorsFor(withId.localId);
                                     }
@@ -1101,6 +1218,9 @@ public class DrawingCanvas extends JComponent {
                             model.addEntity(ent);
                         } else {
                             shapes.add(preview);
+                            // Auto-enter label editing for freehand shapes
+                            int newIndex = shapes.size() - 1;
+                            SwingUtilities.invokeLater(() -> startLabelEditingForDrawnShape(newIndex, Tool.TEXT));
                         }
                         Graphics2D g = getBufferGraphics();
                         drawRecord(g, preview, false);
@@ -1114,6 +1234,7 @@ public class DrawingCanvas extends JComponent {
                 }
 
                 if (currentTool == Tool.SELECT) {
+                    preview = null;
                     // finish move/resize
                     draggingMove = false;
                     resizing = false;
@@ -1138,13 +1259,18 @@ public class DrawingCanvas extends JComponent {
                 if (preview != null && isConnectorTool(currentTool)) {
                     int fromIdx = findAnchorTarget(pressX, pressY);
                     int toIdx = findAnchorTarget(x, y);
-                    if (fromIdx >= 0 && toIdx >= 0 && fromIdx != toIdx) {
+                    boolean allowSelfLoop = isTransitionTool(currentTool);
+                    if (fromIdx >= 0 && toIdx >= 0 && (fromIdx != toIdx || allowSelfLoop)) {
                         ShapeRecord fromShape = shapes.get(fromIdx);
                         ShapeRecord toShape = shapes.get(toIdx);
-                        Point2D.Double[] anchors = computeConnectorAnchors(fromShape, toShape);
+                        Point2D.Double[] anchors = isSelfLoopTransition(currentTool, fromShape, toShape)
+                                ? computeSelfLoopAnchors(fromShape)
+                                : computeConnectorAnchors(fromShape, toShape);
                         Point2D.Double start = anchors[0];
                         Point2D.Double end = anchors[1];
-                        Shape line = new Line2D.Double(start.x, start.y, end.x, end.y);
+                        Shape connectorShape = isSelfLoopTransition(currentTool, fromShape, toShape)
+                            ? buildSelfLoopArc(fromShape, start, end)
+                                : new Line2D.Double(start.x, start.y, end.x, end.y);
 
                         if (model != null && fromShape.entityId != null && toShape.entityId != null) {
                             ReMoDeLEntity ent = new ReMoDeLEntity();
@@ -1158,8 +1284,8 @@ public class DrawingCanvas extends JComponent {
                             model.addEntity(ent);
                         } else {
                             String label = getConnectorLabel(currentTool, null);
-                            Font labelFont = new Font("SansSerif", Font.PLAIN, 12);
-                            ShapeRecord anchored = new ShapeRecord(currentTool, line, drawColor, strokeWidth,
+                            Font labelFont = defaultTextFont();
+                            ShapeRecord anchored = new ShapeRecord(currentTool, connectorShape, drawColor, strokeWidth,
                                 start.x, start.y, end.x, end.y, label, labelFont, null,
                                 null, fromShape.localId, toShape.localId);
                             shapes.add(anchored);
@@ -1169,6 +1295,7 @@ public class DrawingCanvas extends JComponent {
                         }
 
                         preview = null;
+                        setCurrentTool(Tool.SELECT);
                         lastX = lastY = -1;
                         statusConsumer.accept("Ready");
                         repaint();
@@ -1177,11 +1304,20 @@ public class DrawingCanvas extends JComponent {
                 }
 
                 if (preview != null) {
+                    Tool drawnTool = preview.tool;
                     if (model != null) {
                         ReMoDeLEntity ent = entityFromShape(preview);
                         model.addEntity(ent);
                     } else {
                         shapes.add(preview);
+                        if (!isConnectorTool(preview.tool)) sortShapesByArea();
+                        
+                        // Auto-enter label editing for non-connector shapes
+                        int newIndex = shapes.size() - 1;
+                        if (newIndex >= 0 && !isConnectorTool(drawnTool)) {
+                            // Schedule label editing to happen after repaint
+                            SwingUtilities.invokeLater(() -> startLabelEditingForDrawnShape(newIndex, drawnTool));
+                        }
                     }
                     Graphics2D g = getBufferGraphics();
                     drawRecord(g, preview, false);
@@ -1204,6 +1340,32 @@ public class DrawingCanvas extends JComponent {
         });
     }
 
+    /**
+     * Routes to the appropriate label editing method based on the drawn shape type.
+     * Called automatically after a shape is created.
+     */
+    private void startLabelEditingForDrawnShape(int index, Tool tool) {
+        if (index < 0 || index >= shapes.size()) return;
+        
+        // Route to appropriate editing method
+        if (tool == Tool.TEXT) {
+            startEditingText(index);
+        } else if (tool == Tool.RECTANGLE || tool == Tool.OVAL || 
+                   tool == Tool.ROUNDED_RECTANGLE || tool == Tool.STATE ||
+                   tool == Tool.ACTOR || tool == Tool.SYSTEM ||
+                   tool == Tool.BOUNDARY) {
+            startEditingShapeLabel(index);
+        } else if (tool == Tool.OBJECT_TYPE) {
+            startEditingObjectTypeLabel(index);
+        } else if (tool == Tool.IMPACT || tool == Tool.ARROW_OPEN || tool == Tool.ARROW_FILLED 
+                   || tool == Tool.ARROW_EMPTY || tool == Tool.ARROW_DIAMOND 
+                   || tool == Tool.INITIAL_TRANSITION || tool == Tool.FINAL_TRANSITION) {
+            startEditingImpactLabel(index);
+        } else if (tool == Tool.REFERENCE) {
+            startEditingReferenceLabel(index);
+        }
+    }
+
     private void startEditingShapeLabel(int index) {
         if (index < 0 || index >= shapes.size()) return;
         ShapeRecord sel = shapes.get(index);
@@ -1211,7 +1373,8 @@ public class DrawingCanvas extends JComponent {
         // Only editable shapes
         if (sel.tool != Tool.RECTANGLE && sel.tool != Tool.OVAL && 
             sel.tool != Tool.ROUNDED_RECTANGLE && sel.tool != Tool.STATE &&
-            sel.tool != Tool.ACTOR && sel.tool != Tool.SYSTEM) {
+            sel.tool != Tool.ACTOR && sel.tool != Tool.SYSTEM &&
+            sel.tool != Tool.BOUNDARY) {
             return;
         }
         
@@ -1223,10 +1386,10 @@ public class DrawingCanvas extends JComponent {
         String currentText = sel.text != null ? sel.text : getDefaultLabelForTool(sel.tool);
         
         final JTextField tf = new JTextField(currentText);
-        tf.setOpaque(true);
-        tf.setBackground(new Color(255, 255, 255));
+        tf.setOpaque(false);
+        tf.setBackground(new Color(0, 0, 0, 0));
         tf.setForeground(sel.color != null ? sel.color : drawColor);
-        tf.setFont(sel.font != null ? sel.font : new Font("SansSerif", Font.PLAIN, 12));
+        tf.setFont(normalizeTextFont(sel.font));
         tf.setHorizontalAlignment(JTextField.CENTER);
 
         // Apply shape-specific border styling
@@ -1263,8 +1426,24 @@ public class DrawingCanvas extends JComponent {
                 break;
         }
 
-        tf.setBounds((int) b.getX() + 4, (int) b.getY() + 4, 
-                    Math.max(40, (int) b.getWidth() - 8), Math.max(20, (int) b.getHeight() - 8));
+        // Position text field based on text width, centered on shape
+        FontMetrics fm = tf.getFontMetrics(tf.getFont());
+        int textWidth = fm.stringWidth(currentText);
+        int textHeight = fm.getHeight();
+        int editorWidth = Math.max(40, textWidth + 20);  // 20 for padding + caret
+        int editorHeight = Math.max(20, textHeight + 6);
+        
+        if (sel.tool == Tool.ACTOR) {
+            // Position actor label below the actor figure, centered
+            tf.setBounds((int) b.getCenterX() - editorWidth / 2, 
+                        (int) (b.getY() + b.getHeight() + 4), 
+                        editorWidth, editorHeight);
+        } else {
+            // Center horizontally and vertically within shape bounds
+            tf.setBounds((int) (b.getCenterX() - editorWidth / 2), 
+                        (int) (b.getCenterY() - editorHeight / 2), 
+                        editorWidth, editorHeight);
+        }
         
         this.add(tf);
         this.revalidate();
@@ -1272,7 +1451,10 @@ public class DrawingCanvas extends JComponent {
         tf.requestFocusInWindow();
         tf.selectAll();
 
+        final boolean[] finished = {false};
         Runnable finish = () -> {
+            if (finished[0]) return;
+            finished[0] = true;
             String newText = tf.getText().trim();
             if (newText.isEmpty()) newText = getDefaultLabelForTool(sel.tool);
             DrawingCanvas.this.remove(tf);
@@ -1282,6 +1464,7 @@ public class DrawingCanvas extends JComponent {
         };
 
         Runnable cancel = () -> {
+            finished[0] = true;
             DrawingCanvas.this.remove(tf);
             DrawingCanvas.this.revalidate();
             DrawingCanvas.this.repaint();
@@ -1318,18 +1501,24 @@ public class DrawingCanvas extends JComponent {
         if (b == null) return;
 
         String currentText = sel.text != null ? sel.text : getDefaultLabelForTool(sel.tool);
-        Font font = sel.font != null ? sel.font : new Font("SansSerif", Font.PLAIN, 12);
+        Font font = normalizeTextFont(sel.font);
 
         final JTextArea ta = new JTextArea(currentText);
         ta.setLineWrap(true);
         ta.setWrapStyleWord(true);
-        ta.setOpaque(true);
-        ta.setBackground(new Color(255, 255, 255));
+        ta.setOpaque(false);
+        ta.setBackground(new Color(0, 0, 0, 0));
         ta.setForeground(sel.color != null ? sel.color : drawColor);
         ta.setFont(font);
 
-        ta.setBounds((int) b.getX() + 4, (int) b.getY() + 4,
-            Math.max(60, (int) b.getWidth() - 8), Math.max(40, (int) b.getHeight() - 8));
+        FontMetrics fm = getFontMetrics(font);
+        int textWidth = fm.stringWidth(currentText);
+        int textHeight = fm.getHeight() * 2;  // allow for wrapped lines
+        int editorWidth = Math.max(60, textWidth + 20);
+        int editorHeight = Math.max(40, textHeight + 8);
+        ta.setBounds((int) (b.getCenterX() - editorWidth / 2), 
+            (int) (b.getCenterY() - editorHeight / 2),
+            editorWidth, editorHeight);
 
         this.add(ta);
         this.revalidate();
@@ -1337,7 +1526,10 @@ public class DrawingCanvas extends JComponent {
         ta.requestFocusInWindow();
         ta.selectAll();
 
+        final boolean[] finished = {false};
         Runnable finish = () -> {
+            if (finished[0]) return;
+            finished[0] = true;
             String newText = ta.getText().trim();
             if (newText.isEmpty()) newText = getDefaultLabelForTool(sel.tool);
             DrawingCanvas.this.remove(ta);
@@ -1347,6 +1539,7 @@ public class DrawingCanvas extends JComponent {
         };
 
         Runnable cancel = () -> {
+            finished[0] = true;
             DrawingCanvas.this.remove(ta);
             DrawingCanvas.this.revalidate();
             DrawingCanvas.this.repaint();
@@ -1379,22 +1572,24 @@ public class DrawingCanvas extends JComponent {
         selectedIndex = index;
 
         String currentText = sel.text != null ? sel.text : getDefaultLabelForTool(sel.tool);
-        Font font = sel.font != null ? sel.font : new Font("SansSerif", Font.PLAIN, 12);
+        Font font = normalizeTextFont(sel.font);
 
         final JTextField tf = new JTextField(currentText);
-        tf.setOpaque(true);
-        tf.setBackground(new Color(255, 255, 255));
+        tf.setOpaque(false);
+        tf.setBackground(new Color(0, 0, 0, 0));
         tf.setForeground(sel.color != null ? sel.color : drawColor);
         tf.setFont(font);
         tf.setHorizontalAlignment(JTextField.CENTER);
 
         FontMetrics fm = getFontMetrics(font);
-        int textW = Math.max(60, fm.stringWidth(currentText) + 16);
-        int textH = Math.max(20, fm.getHeight() + 4);
+        int textWidth = fm.stringWidth(currentText);
+        int textHeight = fm.getHeight();
+        int editorWidth = Math.max(60, textWidth + 20);
+        int editorHeight = Math.max(20, textHeight + 6);
         int midX = (int) Math.round((sel.x1 + sel.x2) / 2.0);
         int midY = (int) Math.round((sel.y1 + sel.y2) / 2.0);
 
-        tf.setBounds(midX - textW / 2, midY - textH - 8, textW, textH);
+        tf.setBounds(midX - editorWidth / 2, midY - editorHeight - 8, editorWidth, editorHeight);
 
         this.add(tf);
         this.revalidate();
@@ -1402,7 +1597,10 @@ public class DrawingCanvas extends JComponent {
         tf.requestFocusInWindow();
         tf.selectAll();
 
+        final boolean[] finished = {false};
         Runnable finish = () -> {
+            if (finished[0]) return;
+            finished[0] = true;
             String newText = tf.getText().trim();
             if (newText.isEmpty()) newText = getDefaultLabelForTool(sel.tool);
             DrawingCanvas.this.remove(tf);
@@ -1412,6 +1610,7 @@ public class DrawingCanvas extends JComponent {
         };
 
         Runnable cancel = () -> {
+            finished[0] = true;
             DrawingCanvas.this.remove(tf);
             DrawingCanvas.this.revalidate();
             DrawingCanvas.this.repaint();
@@ -1443,23 +1642,25 @@ public class DrawingCanvas extends JComponent {
         selectedIndex = index;
 
         String currentText = sel.text != null ? sel.text : getDefaultLabelForTool(sel.tool);
-        Font font = sel.font != null ? sel.font : new Font("SansSerif", Font.PLAIN, 12);
+        Font font = normalizeTextFont(sel.font);
 
         final JTextArea ta = new JTextArea(currentText);
         ta.setLineWrap(true);
         ta.setWrapStyleWord(true);
-        ta.setOpaque(true);
-        ta.setBackground(new Color(255, 255, 255));
+        ta.setOpaque(false);
+        ta.setBackground(new Color(0, 0, 0, 0));
         ta.setForeground(sel.color != null ? sel.color : drawColor);
         ta.setFont(font);
 
         FontMetrics fm = getFontMetrics(font);
-        int textW = Math.max(80, fm.stringWidth(currentText) + 20);
-        int textH = Math.max(36, fm.getHeight() * 2 + 6);
+        int textWidth = fm.stringWidth(currentText);
+        int textHeight = fm.getHeight();
+        int editorWidth = Math.max(80, textWidth + 20);
+        int editorHeight = Math.max(36, textHeight * 2 + 8);
         int midX = (int) Math.round((sel.x1 + sel.x2) / 2.0);
         int midY = (int) Math.round((sel.y1 + sel.y2) / 2.0);
 
-        ta.setBounds(midX - textW / 2, midY - textH - 8, textW, textH);
+        ta.setBounds(midX - editorWidth / 2, midY - editorHeight - 8, editorWidth, editorHeight);
 
         this.add(ta);
         this.revalidate();
@@ -1467,7 +1668,10 @@ public class DrawingCanvas extends JComponent {
         ta.requestFocusInWindow();
         ta.selectAll();
 
+        final boolean[] finished = {false};
         Runnable finish = () -> {
+            if (finished[0]) return;
+            finished[0] = true;
             String newText = ta.getText().trim();
             if (newText.isEmpty()) newText = getDefaultLabelForTool(sel.tool);
             DrawingCanvas.this.remove(ta);
@@ -1477,6 +1681,7 @@ public class DrawingCanvas extends JComponent {
         };
 
         Runnable cancel = () -> {
+            finished[0] = true;
             DrawingCanvas.this.remove(ta);
             DrawingCanvas.this.revalidate();
             DrawingCanvas.this.repaint();
@@ -1573,8 +1778,6 @@ public class DrawingCanvas extends JComponent {
             case LINE: return "Association";
             case AUTHORISATION: return "Authorisation";
             case ARROW_FILLED: return "datum";
-            case ARROW_EMPTY: return "Generalisation";
-            case ARROW_DIAMOND: return "Composition";
             case ARROW_OPEN: return "event";
             case INITIAL_TRANSITION: return "enter";
             case FINAL_TRANSITION: return "exit";
@@ -1583,7 +1786,7 @@ public class DrawingCanvas extends JComponent {
                 if (referenceQualifier == null || referenceQualifier.isBlank()) return referenceDefaultName;
                 return referenceDefaultName + "\n{" + referenceQualifier + "}";
             }
-            default: return "Label";
+            default: return "";
         }
     }
 
@@ -1591,7 +1794,13 @@ public class DrawingCanvas extends JComponent {
         if (sel == null) return null;
         if (text == null) text = "";
 
-        Font font = sel.font != null ? sel.font : new Font("SansSerif", Font.PLAIN, 12);
+        Font font = normalizeTextFont(sel.font);
+        // Connectors are lines — changing geometry based on text width breaks their endpoints
+        if (isConnectorTool(sel.tool)) {
+            return new ShapeRecord(sel.tool, sel.shape, sel.color, sel.stroke,
+                sel.x1, sel.y1, sel.x2, sel.y2,
+                text, font, sel.entityId, sel.localId, sel.anchorFromId, sel.anchorToId);
+        }
         FontMetrics fm = getFontMetrics(font);
         Rectangle2D b = getShapeBounds(sel);
         if (b == null) return sel;
@@ -1607,19 +1816,26 @@ public class DrawingCanvas extends JComponent {
         double requiredW = b.getWidth();
         double requiredH = b.getHeight();
 
-        switch (sel.tool) {
-            case OBJECT_TYPE:
-                requiredW = Math.max(requiredW, maxLineW + 28);
-                requiredH = Math.max(requiredH, Math.max(40, lines.length * fm.getHeight() + 20));
-                break;
-            case ACTOR:
-                // Actor label is drawn outside the shape; only grow width to keep names readable.
-                requiredW = Math.max(requiredW, maxLineW + 20);
-                break;
-            default:
-                requiredW = Math.max(requiredW, maxLineW + 20);
-                requiredH = Math.max(requiredH, Math.max(24, lines.length * fm.getHeight() + 12));
-                break;
+        if (isConstrainedSizeTool(sel.tool)) {
+            // Constrained entities only extend horizontally based on label length.
+            int pad = sel.tool == Tool.OBJECT_TYPE ? 28 : 20;
+            requiredW = Math.max(requiredW, maxLineW + pad);
+            requiredH = b.getHeight();
+        } else {
+            switch (sel.tool) {
+                case OBJECT_TYPE:
+                    requiredW = Math.max(requiredW, maxLineW + 28);
+                    requiredH = Math.max(requiredH, Math.max(40, lines.length * fm.getHeight() + 20));
+                    break;
+                case ACTOR:
+                    // Actor label is drawn outside the shape; only grow width to keep names readable.
+                    requiredW = Math.max(requiredW, maxLineW + 20);
+                    break;
+                default:
+                    requiredW = Math.max(requiredW, maxLineW + 20);
+                    requiredH = Math.max(requiredH, Math.max(24, lines.length * fm.getHeight() + 12));
+                    break;
+            }
         }
 
         if (requiredW <= b.getWidth() && requiredH <= b.getHeight()) {
@@ -1648,11 +1864,38 @@ public class DrawingCanvas extends JComponent {
     }
 
     /**
-     * Update the label text for a shape at the given index.
+     * Returns a label that is unique among all non-connector shapes, excluding the
+     * shape at {@code ownIndex}. If {@code desired} is already taken, appends
+     * " 2", " 3", etc. until a free name is found.
      */
+    private String uniquifyLabel(String desired, int ownIndex) {
+        if (desired == null) return desired;
+        String candidate = desired;
+        int suffix = 2;
+        outer:
+        while (true) {
+            for (int i = 0; i < shapes.size(); i++) {
+                if (i == ownIndex) continue;
+                ShapeRecord r = shapes.get(i);
+                if (!isConnectorTool(r.tool) && candidate.equalsIgnoreCase(r.text)) {
+                    candidate = desired + " " + suffix++;
+                    continue outer;
+                }
+            }
+            return candidate;
+        }
+    }
+
+    
     private void updateShapeLabel(String newText, int index) {
         if (index < 0 || index >= shapes.size()) return;
         ShapeRecord sel = shapes.get(index);
+        // Enforce unique labels for non-connector shapes so the label can serve as
+        // a stable identifier in exports. If the requested text already belongs to
+        // another shape, append " 2", " 3", etc. until the name is unique.
+        if (!isConnectorTool(sel.tool)) {
+            newText = uniquifyLabel(newText, index);
+        }
         ShapeRecord nr = growShapeForLabel(sel, newText);
         if (nr == null) return;
         
@@ -1687,6 +1930,33 @@ public class DrawingCanvas extends JComponent {
         addUndoableEdit(new TextEdit(index, before, after));
     }
 
+    /**
+     * Reorder shapes so larger non-connector shapes are drawn first (behind)
+     * and connectors are always last (on top). Hit-testing iterates in reverse,
+     * so smaller shapes are hit-tested before the large shapes that contain them.
+     */
+    private void sortShapesByArea() {
+        java.util.List<ShapeRecord> nonConn = new java.util.ArrayList<>();
+        java.util.List<ShapeRecord> conn = new java.util.ArrayList<>();
+        for (ShapeRecord r : shapes) {
+            if (isConnectorTool(r.tool)) conn.add(r);
+            else nonConn.add(r);
+        }
+        // Larger shapes first (drawn behind); connectors always on top
+        nonConn.sort((a, b) -> Double.compare(shapeArea(b), shapeArea(a)));
+        shapes.clear();
+        shapes.addAll(nonConn);
+        shapes.addAll(conn);
+    }
+
+    private double shapeArea(ShapeRecord r) {
+        if (r == null || r.shape == null) return 0;
+        java.awt.geom.Rectangle2D b = r.shape.getBounds2D();
+        return b.getWidth() * b.getHeight();
+    }
+
+    // Hit-testing iterates in reverse; smaller shapes tested before
+    // large containing shapes
     private int hitTest(int x, int y) {
 
         Point2D p = new Point2D.Double(x, y);
@@ -1773,12 +2043,24 @@ public class DrawingCanvas extends JComponent {
         double nx2 = sel.x2;
         double ny2 = sel.y2;
 
-        if (fromShape != null && toShape != null && fromShape != toShape) {
-            Point2D.Double[] anchors = computeConnectorAnchors(fromShape, toShape);
-            nx1 = anchors[0].x;
-            ny1 = anchors[0].y;
-            nx2 = anchors[1].x;
-            ny2 = anchors[1].y;
+        Shape connectorShape = new Line2D.Double(nx1, ny1, nx2, ny2);
+
+        if (fromShape != null && toShape != null) {
+            if (isSelfLoopTransition(sel.tool, fromShape, toShape)) {
+                Point2D.Double[] anchors = computeSelfLoopAnchors(fromShape);
+                nx1 = anchors[0].x;
+                ny1 = anchors[0].y;
+                nx2 = anchors[1].x;
+                ny2 = anchors[1].y;
+                connectorShape = buildSelfLoopArc(fromShape, anchors[0], anchors[1]);
+            } else if (fromShape != toShape) {
+                Point2D.Double[] anchors = computeConnectorAnchors(fromShape, toShape);
+                nx1 = anchors[0].x;
+                ny1 = anchors[0].y;
+                nx2 = anchors[1].x;
+                ny2 = anchors[1].y;
+                connectorShape = new Line2D.Double(nx1, ny1, nx2, ny2);
+            }
         } else {
             if (fromShape != null) {
                 Point2D.Double snapped = intersectShapeBoundary(fromShape, getShapeCenter(fromShape), new Point2D.Double(sel.x2, sel.y2));
@@ -1794,10 +2076,10 @@ public class DrawingCanvas extends JComponent {
                     ny2 = snapped.y;
                 }
             }
+            connectorShape = new Line2D.Double(nx1, ny1, nx2, ny2);
         }
 
-        Shape line = new Line2D.Double(nx1, ny1, nx2, ny2);
-        return new ShapeRecord(sel.tool, line, sel.color, sel.stroke, nx1, ny1, nx2, ny2,
+        return new ShapeRecord(sel.tool, connectorShape, sel.color, sel.stroke, nx1, ny1, nx2, ny2,
             sel.text, sel.font, sel.entityId, sel.localId, fromAnchor, toAnchor);
     }
 
@@ -1852,16 +2134,26 @@ public class DrawingCanvas extends JComponent {
 
         ShapeRecord fromShape = findShapeByLocalId(fromAnchor);
         ShapeRecord toShape = findShapeByLocalId(toAnchor);
-        if (fromShape != null && toShape != null && fromShape != toShape) {
-            Point2D.Double[] anchors = computeConnectorAnchors(fromShape, toShape);
-            nx1 = anchors[0].x;
-            ny1 = anchors[0].y;
-            nx2 = anchors[1].x;
-            ny2 = anchors[1].y;
+        Shape connectorShape = new Line2D.Double(nx1, ny1, nx2, ny2);
+        if (fromShape != null && toShape != null) {
+            if (isSelfLoopTransition(sel.tool, fromShape, toShape)) {
+                Point2D.Double[] anchors = computeSelfLoopAnchors(fromShape);
+                nx1 = anchors[0].x;
+                ny1 = anchors[0].y;
+                nx2 = anchors[1].x;
+                ny2 = anchors[1].y;
+                connectorShape = buildSelfLoopArc(fromShape, anchors[0], anchors[1]);
+            } else if (fromShape != toShape) {
+                Point2D.Double[] anchors = computeConnectorAnchors(fromShape, toShape);
+                nx1 = anchors[0].x;
+                ny1 = anchors[0].y;
+                nx2 = anchors[1].x;
+                ny2 = anchors[1].y;
+                connectorShape = new Line2D.Double(nx1, ny1, nx2, ny2);
+            }
         }
 
-        Shape line = new Line2D.Double(nx1, ny1, nx2, ny2);
-        ShapeRecord updated = new ShapeRecord(sel.tool, line, sel.color, sel.stroke, nx1, ny1, nx2, ny2,
+        ShapeRecord updated = new ShapeRecord(sel.tool, connectorShape, sel.color, sel.stroke, nx1, ny1, nx2, ny2,
             sel.text, sel.font, sel.entityId, sel.localId, fromAnchor, toAnchor);
         if (updated.entityId == null && updated.anchorFromId == null && updated.anchorToId == null) {
             // no model-backed anchors: keep explicit coordinates for free connector editing
@@ -1881,7 +2173,17 @@ public class DrawingCanvas extends JComponent {
         int rw = Math.abs(x2 - x1);
         int rh = Math.abs(y2 - y1);
         String text = null;
-        Font font = null;
+        Font font = defaultTextFont();
+
+        if (isConstrainedSizeTool(t)) {
+            // Creation preview for constrained entities is always the default size.
+            rw = ENTITY_DEFAULT_WIDTH;
+            rh = ENTITY_DEFAULT_HEIGHT;
+            rx = x1;
+            ry = y1;
+            x2 = x1 + rw;
+            y2 = y1 + rh;
+        }
 
         switch (t) {
 
@@ -1901,42 +2203,38 @@ public class DrawingCanvas extends JComponent {
             case STATE:
                 s = new RoundRectangle2D.Double(rx, ry, rw, rh, rh, rh);
                 text = "State";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case OVAL:
                 s = new Ellipse2D.Double(rx, ry, rw, rh);
                 text = "Task";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case RECTANGLE:
                 s = new Rectangle2D.Double(rx, ry, rw, rh);
                 text = "Object";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case OBJECT_TYPE:
                 s = new Rectangle2D.Double(rx, ry, rw, rh);
                 text = "Object\nattribute";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 4));
                 break;
             case SYSTEM:
                 s = new Rectangle2D.Double(rx, ry, rw, rh);
                 text = "System";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case ROUNDED_RECTANGLE:
                 s = new RoundRectangle2D.Double(rx, ry, rw, rh, Math.max(8, Math.min(rw, rh) / 4.0), Math.max(8, Math.min(rw, rh) / 4.0));
                 text = "Process";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case BOUNDARY:
                 s = buildBoundaryShape(rx, ry, rw, rh);
                 text = "Boundary";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 4));
                 break;
             case ACTOR:
-                s = buildActorShape(rx, ry, rw, rh);
+                int actorPreviewW = ACTOR_DEFAULT_WIDTH;
+                int actorPreviewH = ACTOR_DEFAULT_HEIGHT;
+                s = buildActorShape(x1, y1, actorPreviewW, actorPreviewH);
+                x2 = x1 + actorPreviewW;
+                y2 = y1 + actorPreviewH;
                 text = "Actor";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 4));
                 break;
             default:
                 s = new Line2D.Double(x1, y1, x2, y2);
@@ -1951,90 +2249,103 @@ public class DrawingCanvas extends JComponent {
         int ry = Math.min(y1, y2);
         int rw = Math.abs(x2 - x1);
         int rh = Math.abs(y2 - y1);
+        int[] fixed = enforceDefaultSize(t, rw, rh);
+        if (isConstrainedSizeTool(t)) {
+            rw = fixed[0];
+            rh = fixed[1];
+            rx = Math.min(x1, x2);
+            ry = Math.min(y1, y2);
+            x1 = rx;
+            y1 = ry;
+            x2 = rx + rw;
+            y2 = ry + rh;
+        }
         Shape s = null;
         String text = null;
-        Font font = null;
+        Font font = defaultTextFont();
         
         switch (t) {
             case LINE:
+                s = new Line2D.Double(x1, y1, x2, y2);
                 text = "Association";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case AUTHORISATION:
+                s = new Line2D.Double(x1, y1, x2, y2);
                 text = "Authorisation";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case ENACTS:
                 s = new Line2D.Double(x1, y1, x2, y2);
                 text = "Enacts";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case ARROW_FILLED:
+                s = new Line2D.Double(x1, y1, x2, y2);
                 text = "Data Flow";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case ARROW_DIAMOND:
-                text = "Composition";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                s = new Line2D.Double(x1, y1, x2, y2);
                 break;
             case ARROW_OPEN:
+                s = new Line2D.Double(x1, y1, x2, y2);
                 text = "Transition";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
+                break;
+            case INITIAL_TRANSITION:
+                s = new Line2D.Double(x1, y1, x2, y2);
+                text = "Initial";
+                break;
+            case FINAL_TRANSITION:
+                s = new Line2D.Double(x1, y1, x2, y2);
+                text = "Final";
                 break;
             case REFERENCE:
                 s = new Line2D.Double(x1, y1, x2, y2);
                 text = getDefaultLabelForTool(Tool.REFERENCE);
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case IMPACT:
                 s = new Line2D.Double(x1, y1, x2, y2);
                 text = "create";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case ARROW_EMPTY:
                 s = new Line2D.Double(x1, y1, x2, y2);
-                text = "Generalisation";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case STATE:
                 s = new RoundRectangle2D.Double(rx, ry, rw, rh, rh, rh);
                 text = "State";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case OVAL:
                 s = new Ellipse2D.Double(rx, ry, rw, rh);
                 text = "Task";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case RECTANGLE:
                 s = new Rectangle2D.Double(rx, ry, rw, rh);
                 text = "Object";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case OBJECT_TYPE:
                 s = new Rectangle2D.Double(rx, ry, rw, rh);
                 text = "Object\nattribute";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 4));
                 break;
             case SYSTEM:
                 s = new Rectangle2D.Double(rx, ry, rw, rh);
                 text = "System";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case ROUNDED_RECTANGLE:
                 s = new RoundRectangle2D.Double(rx, ry, rw, rh, Math.max(8, Math.min(rw, rh) / 4.0), Math.max(8, Math.min(rw, rh) / 4.0));
                 text = "Process";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 3));
                 break;
             case BOUNDARY:
                 s = buildBoundaryShape(rx, ry, rw, rh);
                 text = "Boundary";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 4));
                 break;
             case ACTOR:
-                s = buildActorShape(rx, ry, rw, rh);
+                int actorX = Math.min(x1, x2);
+                int actorY = Math.min(y1, y2);
+                int actorW = ACTOR_DEFAULT_WIDTH;
+                int actorH = ACTOR_DEFAULT_HEIGHT;
+                s = buildActorShape(actorX, actorY, actorW, actorH);
+                x1 = actorX;
+                y1 = actorY;
+                x2 = actorX + actorW;
+                y2 = actorY + actorH;
                 text = "Actor";
-                font = new Font("SansSerif", Font.PLAIN, Math.max(12, rh / 4));
                 break;
             case FREEHAND:
             default:
@@ -2185,6 +2496,24 @@ public class DrawingCanvas extends JComponent {
         g2.dispose();
     }
 
+    private Point2D.Double arcTangentTail(Arc2D arc) {
+        if (arc == null) return new Point2D.Double(0, 0);
+
+        double endAngle = arc.getAngleStart() + arc.getAngleExtent();
+        double direction = arc.getAngleExtent() >= 0 ? 1.0 : -1.0;
+        double delta = Math.min(8.0, Math.abs(arc.getAngleExtent()) / 4.0);
+        if (delta < 0.5) delta = 0.5;
+        double tailAngle = endAngle - direction * delta;
+
+        double rx = arc.getWidth() / 2.0;
+        double ry = arc.getHeight() / 2.0;
+        double cx = arc.getX() + rx;
+        double cy = arc.getY() + ry;
+        double rad = Math.toRadians(tailAngle);
+
+        return new Point2D.Double(cx + rx * Math.cos(rad), cy - ry * Math.sin(rad));
+    }
+
     private void drawRecord(Graphics2D g, ShapeRecord r, boolean isPreview) {
         Stroke prev = g.getStroke();
         Color prevC = g.getColor();
@@ -2204,10 +2533,24 @@ public class DrawingCanvas extends JComponent {
                 g.setStroke(oldStroke);
                 break;
             case ENACTS: {
-                g.draw(r.shape);
                 double rDot = Math.max(3.5, r.stroke + 2.0);
-                double cx = r.x1 - rDot;
-                double cy = r.y1 - rDot;
+                double dx = r.x2 - r.x1;
+                double dy = r.y2 - r.y1;
+                double len = Math.hypot(dx, dy);
+
+                if (len > 1e-6) {
+                    // Stop the shaft at the dot boundary so the end-cap dot is visually terminal.
+                    double ux = dx / len;
+                    double uy = dy / len;
+                    double endX = r.x2 - ux * rDot;
+                    double endY = r.y2 - uy * rDot;
+                    g.draw(new Line2D.Double(r.x1, r.y1, endX, endY));
+                } else {
+                    g.draw(r.shape);
+                }
+
+                double cx = r.x2 - rDot;
+                double cy = r.y2 - rDot;
                 g.fill(new Ellipse2D.Double(cx, cy, rDot * 2, rDot * 2));
                 break;
             }
@@ -2219,7 +2562,7 @@ public class DrawingCanvas extends JComponent {
                 // Draw text label if present
                 if (r.text != null) {
                     Rectangle2D bounds = r.shape.getBounds2D();
-                    Font f = r.font != null ? r.font : new Font("SansSerif", Font.PLAIN, 12);
+                    Font f = normalizeTextFont(r.font);
                     g.setFont(f);
                     drawTextLayout(g, r.text, f, bounds, r.color != null ? r.color : g.getColor());
                 }
@@ -2241,13 +2584,13 @@ public class DrawingCanvas extends JComponent {
                 g.draw(r.shape);
                 if (r.text != null) {
                     Rectangle2D bounds = r.shape.getBounds2D();
-                    Font f = r.font != null ? r.font : new Font("SansSerif", Font.PLAIN, 12);
+                    Font f = normalizeTextFont(r.font);
                     g.setFont(f);
                     String label = r.text.split("\\R", 2)[0];
                     FontMetrics fm = g.getFontMetrics(f);
                     int textWidth = fm.stringWidth(label);
                     float textX = (float) (bounds.getCenterX() - textWidth / 2.0);
-                    float textY = (float) (bounds.getY() - 4.0);
+                    float textY = (float) (bounds.getY() + bounds.getHeight() + fm.getAscent() + 4.0);
                     g.setColor(r.color != null ? r.color : g.getColor());
                     g.drawString(label, textX, textY);
                 }
@@ -2261,6 +2604,52 @@ public class DrawingCanvas extends JComponent {
             case REFERENCE:
             case INITIAL_TRANSITION:
             case FINAL_TRANSITION: {
+                if (isSelfLoopTransition(r) && (r.shape instanceof Arc2D || r.shape instanceof CubicCurve2D)) {
+                    Point2D.Double tangentStart;
+                    if (r.shape instanceof CubicCurve2D) {
+                        CubicCurve2D loop = (CubicCurve2D) r.shape;
+                        g.draw(loop);
+                        tangentStart = new Point2D.Double(loop.getCtrlX2(), loop.getCtrlY2());
+                    } else {
+                        Arc2D loop = (Arc2D) r.shape;
+                        g.draw(loop);
+                        tangentStart = arcTangentTail(loop);
+                    }
+
+                    if (r.tool == Tool.INITIAL_TRANSITION) {
+                        double circleRadius = Math.max(6, r.stroke * 2);
+                        g.fill(new Ellipse2D.Double(r.x1 - circleRadius, r.y1 - circleRadius, circleRadius * 2, circleRadius * 2));
+                    }
+
+                    double tangentStartX = tangentStart.x;
+                    double tangentStartY = tangentStart.y;
+                    drawArrowHead(g, tangentStartX, tangentStartY, r.x2, r.y2, r.tool);
+
+                    if (r.tool == Tool.FINAL_TRANSITION) {
+                        double circleRadius = Math.max(8, r.stroke * 2.5);
+                        g.draw(new Ellipse2D.Double(r.x2 - circleRadius, r.y2 - circleRadius, circleRadius * 2, circleRadius * 2));
+                        double crossSize = circleRadius * 0.6;
+                        g.draw(new Line2D.Double(r.x2 - crossSize, r.y2 - crossSize, r.x2 + crossSize, r.y2 + crossSize));
+                        g.draw(new Line2D.Double(r.x2 - crossSize, r.y2 + crossSize, r.x2 + crossSize, r.y2 - crossSize));
+                    }
+
+                    if (r.text != null && !r.text.isBlank()) {
+                        Font f = normalizeTextFont(r.font);
+                        g.setFont(f);
+                        if (r.tool == Tool.ARROW_OPEN || r.tool == Tool.ARROW_FILLED || r.tool == Tool.ARROW_EMPTY || r.tool == Tool.ARROW_DIAMOND
+                            || r.tool == Tool.INITIAL_TRANSITION || r.tool == Tool.FINAL_TRANSITION) {
+                            if (r.shape instanceof Arc2D) {
+                                drawSelfLoopTransitionLabel(g, (Arc2D) r.shape, r.text, f);
+                            } else {
+                                drawTransitionLabel(g, r, f);
+                            }
+                        } else if (r.tool == Tool.IMPACT || r.tool == Tool.REFERENCE) {
+                            drawReferenceLabel(g, r, f);
+                        }
+                    }
+                    break;
+                }
+
                 double tipX = r.x2;
                 double tipY = r.y2;
 
@@ -2297,6 +2686,18 @@ public class DrawingCanvas extends JComponent {
                         shaftStartY = r.y1 + uy * circleRadius;
                     }
                 }
+
+                if (r.tool == Tool.ARROW_DIAMOND) {
+                    double dx = tipX - shaftStartX;
+                    double dy = tipY - shaftStartY;
+                    double len = Math.hypot(dx, dy);
+                    if (len > 1e-6) {
+                        double ux = dx / len;
+                        double uy = dy / len;
+                        double diamondLen = Math.max(10.0, 8.0 + r.stroke * 2.4);
+                        baseAll = new Point2D.Double(tipX - ux * diamondLen, tipY - uy * diamondLen);
+                    }
+                }
                 
                 Line2D shaftAll = new Line2D.Double(shaftStartX, shaftStartY, baseAll.x, baseAll.y);
                 g.draw(shaftAll);
@@ -2320,7 +2721,7 @@ public class DrawingCanvas extends JComponent {
                     g.draw(new Line2D.Double(r.x2 - crossSize, r.y2 + crossSize, r.x2 + crossSize, r.y2 - crossSize));
                 }
                 if (r.text != null && !r.text.isBlank()) {
-                    Font f = r.font != null ? r.font : new Font("SansSerif", Font.PLAIN, 12);
+                    Font f = normalizeTextFont(r.font);
                     g.setFont(f);
                     if (r.tool == Tool.ARROW_OPEN || r.tool == Tool.ARROW_FILLED || r.tool == Tool.ARROW_EMPTY || r.tool == Tool.ARROW_DIAMOND 
                         || r.tool == Tool.INITIAL_TRANSITION || r.tool == Tool.FINAL_TRANSITION) {
@@ -2335,7 +2736,7 @@ public class DrawingCanvas extends JComponent {
                 g.draw(r.shape);
                 Rectangle2D bounds = r.shape.getBounds2D();
                 if (r.text != null) {
-                    Font f = r.font != null ? r.font : new Font("SansSerif", Font.PLAIN, 12);
+                    Font f = normalizeTextFont(r.font);
                     g.setFont(f);
                     drawTextLayout(g, r.text, f, bounds, r.color != null ? r.color : g.getColor());
                 }
@@ -2346,7 +2747,7 @@ public class DrawingCanvas extends JComponent {
                 try {
                     Rectangle2D bounds = r.shape.getBounds2D();
                     if (r.text != null) {
-                        Font f = r.font != null ? r.font : g.getFont();
+                        Font f = normalizeTextFont(r.font);
                         g.setFont(f);
                         drawTextLayout(g, r.text, f, bounds, r.color != null ? r.color : g.getColor());
                     }
@@ -2405,7 +2806,7 @@ public class DrawingCanvas extends JComponent {
                 g.setColor(Color.BLUE);
                 g.draw(start);
                 g.draw(end);
-            } else if (b != null) {
+            } else if (b != null && sel.tool != Tool.ACTOR && !isConstrainedSizeTool(sel.tool)) {
                 double hx = b.getX(), hy = b.getY(), hw = b.getWidth(), hh = b.getHeight();
                 double mx = hx + hw / 2.0, my = hy + hh / 2.0;
                 double edgeHandle = Math.max(8, HANDLE_SIZE - 2);
@@ -2464,14 +2865,24 @@ public class DrawingCanvas extends JComponent {
                 break;
             }
             case ARROW_DIAMOND: {
-                // diamond center at bx - ux*(headLen/2)
-                double cx = bx - ux * (headLen / 2.0);
-                double cy = by - uy * (headLen / 2.0);
+                // Balanced diamond: equal-looking longitudinal and lateral diagonals.
+                double diamondLen = Math.max(10.0, headLen * 1.05);
+                double halfDiag = diamondLen / 2.0;
+
+                double mx = x2 - ux * halfDiag;
+                double my = y2 - uy * halfDiag;
+                double rx = x2 - ux * diamondLen;
+                double ry = y2 - uy * diamondLen;
+                double lx = mx + px * halfDiag;
+                double ly = my + py * halfDiag;
+                double rxSide = mx - px * halfDiag;
+                double rySide = my - py * halfDiag;
+
                 Path2D d = new Path2D.Double();
                 d.moveTo(x2, y2);
-                d.lineTo(sx1, sy1);
-                d.lineTo(cx, cy);
-                d.lineTo(sx2, sy2);
+                d.lineTo(lx, ly);
+                d.lineTo(rx, ry);
+                d.lineTo(rxSide, rySide);
                 d.closePath();
                 g.draw(d);
                 break;
@@ -2537,7 +2948,7 @@ public class DrawingCanvas extends JComponent {
         g.draw(side);
 
         if (r.text != null) {
-            Font f = r.font != null ? r.font : new Font("SansSerif", Font.PLAIN, 12);
+            Font f = normalizeTextFont(r.font);
             g.setFont(f);
             drawTextLayout(g, r.text, f, front, base);
         }
@@ -2551,22 +2962,17 @@ public class DrawingCanvas extends JComponent {
         double h = bounds.getHeight();
 
         String label = (r.text != null && !r.text.isBlank()) ? r.text.split("\\R", 2)[0].trim() : "Boundary";
-        Font baseFont = r.font != null ? r.font : new Font("SansSerif", Font.PLAIN, 11);
+        Font baseFont = normalizeTextFont(r.font);
 
         double minTabHeight = Math.max(18, h * 0.14);
         double maxTabHeight = Math.max(minTabHeight, h * 0.30);
         double tabHeight = Math.min(maxTabHeight, Math.max(minTabHeight, baseFont.getSize() + 10));
 
-        int minFontSize = 8;
         Font fitFont = baseFont;
         FontMetrics fitFm = g.getFontMetrics(fitFont);
 
         double maxTabWidth = Math.max(24, w - 6);
-        while (fitFm.stringWidth(label) + 16 > maxTabWidth && fitFont.getSize() > minFontSize) {
-            fitFont = fitFont.deriveFont((float) (fitFont.getSize() - 1));
-            fitFm = g.getFontMetrics(fitFont);
-            tabHeight = Math.min(maxTabHeight, Math.max(minTabHeight, fitFont.getSize() + 10));
-        }
+        tabHeight = Math.min(maxTabHeight, Math.max(minTabHeight, fitFont.getSize() + 10));
 
         String drawLabel = label;
         if (fitFm.stringWidth(drawLabel) + 16 > maxTabWidth) {
@@ -2667,6 +3073,45 @@ public class DrawingCanvas extends JComponent {
         drawAlignedConnectorLabel(g, r, f, new String[] { text }, false);
     }
 
+    private void drawSelfLoopTransitionLabel(Graphics2D g, Arc2D arc, String text, Font f) {
+        if (arc == null || text == null) return;
+        String label = text.trim();
+        if (label.isEmpty()) return;
+
+        Font font = f != null ? f : g.getFont();
+        g.setFont(font);
+        FontMetrics fm = g.getFontMetrics(font);
+
+        // Place near the lower-right interior of the loop so it stays inside
+        // the loop and out of the state body.
+        double angleDeg = 335.0;
+        double rad = Math.toRadians(angleDeg);
+        double rx = arc.getWidth() / 2.0;
+        double ry = arc.getHeight() / 2.0;
+        double cx = arc.getX() + rx;
+        double cy = arc.getY() + ry;
+
+        double px = cx + rx * Math.cos(rad);
+        double py = cy - ry * Math.sin(rad);
+
+        // Pull label inward from the arc along ellipse normal direction.
+        double nx = Math.cos(rad) / Math.max(1e-6, rx);
+        double ny = -Math.sin(rad) / Math.max(1e-6, ry);
+        double nLen = Math.hypot(nx, ny);
+        if (nLen > 1e-6) {
+            nx /= nLen;
+            ny /= nLen;
+        }
+        double offset = Math.max(16.0, fm.getHeight() * 0.9);
+        px -= nx * offset;
+        py -= ny * offset;
+
+        int textWidth = fm.stringWidth(label);
+        float tx = (float) (px - textWidth / 2.0);
+        float ty = (float) (py + fm.getAscent() / 2.0);
+        g.drawString(label, tx, ty);
+    }
+
     private void drawReferenceLabel(Graphics2D g, ShapeRecord r, Font f) {
         if (r.text == null) return;
         String[] lines = r.text.split("\\R");
@@ -2702,7 +3147,7 @@ public class DrawingCanvas extends JComponent {
         String[] lines = text.split("\\R");
         String name = lines.length > 0 && !lines[0].isBlank() ? lines[0].trim() : "Object";
 
-        Font baseFont = r.font != null ? r.font : new Font("SansSerif", Font.PLAIN, 12);
+        Font baseFont = normalizeTextFont(r.font);
         Font nameFont = baseFont.deriveFont(Font.BOLD);
         g.setFont(nameFont);
         FontMetrics nameFm = g.getFontMetrics(nameFont);
@@ -2777,48 +3222,72 @@ public class DrawingCanvas extends JComponent {
         g.setColor(color != null ? color : g.getColor());
         FontMetrics fm = g.getFontMetrics(g.getFont());
         int wrapWidth = Math.max(4, (int) bounds.getWidth() - 8);
-        float y = (float) (bounds.getY() + 4f) + fm.getAscent();
+        java.util.List<String> lines = new ArrayList<>();
+        java.util.List<Boolean> addLeadingAfter = new ArrayList<>();
 
-        String[] paragraphs = text.split("\r?\n");
+        String[] paragraphs = text.split("\r?\n", -1);
         for (int p = 0; p < paragraphs.length; p++) {
             String paragraph = paragraphs[p].trim();
+            int linesBefore = lines.size();
+
             if (paragraph.isEmpty()) {
-                y += fm.getHeight();
-                if (y > bounds.getY() + bounds.getHeight()) break;
-                continue;
-            }
-            String[] words = paragraph.split("\\s+");
-            StringBuilder line = new StringBuilder();
-            for (int i = 0; i < words.length; i++) {
-                String word = words[i];
-                String test = line.length() == 0 ? word : line + " " + word;
-                int w = fm.stringWidth(test);
-                if (w > wrapWidth && line.length() > 0) {
-                    // draw current line (centered)
-                    String lineStr = line.toString();
-                    int lineWidth = fm.stringWidth(lineStr);
-                    float x = (float) (bounds.getX() + (bounds.getWidth() - lineWidth) / 2.0);
-                    g.drawString(lineStr, x, y);
-                    y += fm.getHeight();
-                    if (y > bounds.getY() + bounds.getHeight()) return;
-                    line.setLength(0);
-                    line.append(word);
-                } else {
-                    if (line.length() > 0) line.append(' ');
-                    line.append(word);
+                lines.add("");
+                addLeadingAfter.add(false);
+            } else {
+                String[] words = paragraph.split("\\s+");
+                StringBuilder line = new StringBuilder();
+                for (int i = 0; i < words.length; i++) {
+                    String word = words[i];
+                    String test = line.length() == 0 ? word : line + " " + word;
+                    int w = fm.stringWidth(test);
+                    if (w > wrapWidth && line.length() > 0) {
+                        lines.add(line.toString());
+                        addLeadingAfter.add(false);
+                        line.setLength(0);
+                        line.append(word);
+                    } else {
+                        if (line.length() > 0) line.append(' ');
+                        line.append(word);
+                    }
+                }
+                if (line.length() > 0) {
+                    lines.add(line.toString());
+                    addLeadingAfter.add(false);
                 }
             }
-            if (line.length() > 0) {
-                // draw last line (centered)
-                String lineStr = line.toString();
+
+            if (p < paragraphs.length - 1 && lines.size() > linesBefore) {
+                int lastIndex = lines.size() - 1;
+                addLeadingAfter.set(lastIndex, true);
+            }
+        }
+
+        if (lines.isEmpty()) return;
+
+        double totalHeight = 0;
+        for (int i = 0; i < lines.size(); i++) {
+            totalHeight += fm.getHeight();
+            if (Boolean.TRUE.equals(addLeadingAfter.get(i))) {
+                totalHeight += fm.getLeading();
+            }
+        }
+
+        double minBaseline = bounds.getY() + 4.0 + fm.getAscent();
+        float y = (float) (bounds.getY() + (bounds.getHeight() - totalHeight) / 2.0 + fm.getAscent());
+        if (y < minBaseline) y = (float) minBaseline;
+
+        for (int i = 0; i < lines.size(); i++) {
+            String lineStr = lines.get(i);
+            if (!lineStr.isEmpty()) {
                 int lineWidth = fm.stringWidth(lineStr);
                 float x = (float) (bounds.getX() + (bounds.getWidth() - lineWidth) / 2.0);
                 g.drawString(lineStr, x, y);
-                y += fm.getHeight();
-                if (y > bounds.getY() + bounds.getHeight()) return;
             }
-            // add paragraph spacing
-            y += fm.getLeading();
+            y += fm.getHeight();
+            if (Boolean.TRUE.equals(addLeadingAfter.get(i))) {
+                y += fm.getLeading();
+            }
+            if (y > bounds.getY() + bounds.getHeight()) return;
         }
     }
 
@@ -3002,7 +3471,7 @@ public class DrawingCanvas extends JComponent {
         int y = Math.max(10, (getHeight() - dh) / 2);
 
         // Create a text shape (using a rectangle as placeholder)
-        Font f = new Font("SansSerif", Font.PLAIN, Math.max(12, dh / 2));
+        Font f = defaultTextFont();
         ShapeRecord r = ShapeRecord.textRecord(text, f, drawColor, strokeWidth, x, y, dw,  dh);
         shapes.add(r);
         redrawBuffer();
@@ -3014,7 +3483,7 @@ public class DrawingCanvas extends JComponent {
      */
     public void addTextAt(String text, int x, int y, int w, int h) {
         if (text == null) text = "";
-        Font f = new Font("SansSerif", Font.PLAIN, Math.max(12, h / 2));
+        Font f = defaultTextFont();
         // If a model is present, create a model entity and let the model listener populate the canvas.
         if (model != null) {
             ReMoDeLEntity ent = new ReMoDeLEntity();
@@ -3071,7 +3540,7 @@ public class DrawingCanvas extends JComponent {
         ta.setOpaque(true);
         ta.setBackground(Color.WHITE);
         ta.setForeground(sel.color != null ? sel.color : drawColor);
-        ta.setFont(sel.font != null ? sel.font : getFont());
+        ta.setFont(normalizeTextFont(sel.font));
         JScrollPane sp = new JScrollPane(ta);
         sp.setBounds((int) b.getX(), (int) b.getY(), Math.max(40, (int) b.getWidth()), Math.max(24, (int) b.getHeight()));
         this.add(sp);
@@ -3080,7 +3549,10 @@ public class DrawingCanvas extends JComponent {
         ta.requestFocusInWindow();
         ta.selectAll();
 
+        final boolean[] finished = {false};
         Runnable finish = () -> {
+            if (finished[0]) return;
+            finished[0] = true;
             String txt = ta.getText();
             DrawingCanvas.this.remove(sp);
             // update the selected text record
@@ -3090,6 +3562,7 @@ public class DrawingCanvas extends JComponent {
         };
 
         Runnable cancel = () -> {
+            finished[0] = true;
             DrawingCanvas.this.remove(sp);
             DrawingCanvas.this.revalidate();
             DrawingCanvas.this.repaint();
@@ -3121,13 +3594,58 @@ public class DrawingCanvas extends JComponent {
         if (selectedIndex >= 0 && selectedIndex < shapes.size()) {
             ShapeRecord sel = shapes.get(selectedIndex);
             if (sel != null && sel.entityId != null && model != null) {
-                model.removeEntity(sel.entityId);
+                // Cascade delete: remove the selected entity and every connector tied to it.
+                removeEntityAndConnectedConnectors(sel);
             } else {
-                shapes.remove(selectedIndex);
+                removeShapeAndConnectedConnectors(sel);
                 redrawBuffer();
                 repaint();
             }
             selectedIndex = -1;
+        }
+    }
+
+    private void removeEntityAndConnectedConnectors(ShapeRecord selected) {
+        if (selected == null || selected.entityId == null || model == null) return;
+
+        java.util.List<String> connectorIds = new ArrayList<>();
+        for (ReMoDeLEntity entity : model.getAll()) {
+            if (!isConnectorEntity(entity)) continue;
+            Object fromObj = entity.get("fromId") != null ? entity.get("fromId") : entity.get("from");
+            Object toObj = entity.get("toId") != null ? entity.get("toId") : entity.get("to");
+            String fromId = fromObj != null ? String.valueOf(fromObj) : null;
+            String toId = toObj != null ? String.valueOf(toObj) : null;
+            if (selected.entityId.equals(fromId) || selected.entityId.equals(toId)) {
+                connectorIds.add(entity.getId());
+            }
+        }
+
+        model.removeEntity(selected.entityId);
+        for (String connectorId : connectorIds) {
+            model.removeEntity(connectorId);
+        }
+    }
+
+    private void removeShapeAndConnectedConnectors(ShapeRecord selected) {
+        if (selected == null) return;
+
+        if (isConnectorTool(selected.tool)) {
+            shapes.remove(selectedIndex);
+            return;
+        }
+
+        String selectedLocalId = selected.localId;
+        for (int i = shapes.size() - 1; i >= 0; i--) {
+            ShapeRecord candidate = shapes.get(i);
+            if (candidate == null || !isConnectorTool(candidate.tool)) continue;
+            if (selectedLocalId == null) continue;
+            if (selectedLocalId.equals(candidate.anchorFromId) || selectedLocalId.equals(candidate.anchorToId)) {
+                shapes.remove(i);
+            }
+        }
+
+        if (selectedIndex >= 0 && selectedIndex < shapes.size()) {
+            shapes.remove(selectedIndex);
         }
     }
 
@@ -3145,7 +3663,7 @@ public class DrawingCanvas extends JComponent {
                sel.stroke,
                sel.x1, sel.y1, sel.x2, sel.y2,
                newText != null ? newText : sel.text,
-                    newFont != null ? newFont : sel.font,
+                    normalizeTextFont(newFont != null ? newFont : sel.font),
                     sel.entityId,
                     sel.localId,
                     sel.anchorFromId,
@@ -3197,6 +3715,10 @@ public class DrawingCanvas extends JComponent {
 
     public boolean canRedo() {
         return undoManager.canRedo();
+    }
+
+    public boolean hasDrawingContent() {
+        return !shapes.isEmpty();
     }
 
     private void updateUndoRedoState() {

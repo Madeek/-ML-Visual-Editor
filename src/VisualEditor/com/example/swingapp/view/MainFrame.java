@@ -9,7 +9,7 @@ public class MainFrame extends JFrame {
     private final ToolBarShell toolbar;
 
     public MainFrame(DrawingCanvas canvas, ToolBarShell toolbar) {
-        super("Visual Editor App");
+        super("µML Editor");
         this.canvas = Objects.requireNonNull(canvas, "canvas");
         this.toolbar = Objects.requireNonNull(toolbar, "toolbar");
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);

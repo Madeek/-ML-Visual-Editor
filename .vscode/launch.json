@@ -6,58 +6,16 @@
     "configurations": [
         {
             "type": "java",
-            "name": "Main",
+            "name": "Main (Module)",
             "request": "launch",
             "mainClass": "VisualEditor/com.example.swingapp.app.Main",
-            "projectName": "VisualEditor_80dc0a36"
-        },
-        {
-            "type": "java",
-            "name": "Main",
-            "request": "launch",
-            "mainClass": "VisualEditor/com.example.swingapp.Main",
-            "projectName": "VisualEditor_80dc0a36"
-        },
-        {
-            "type": "java",
-            "name": "MainFrame",
-            "request": "launch",
-            "mainClass": "VisualEditor/com.example.swingapp.MainFrame",
-            "projectName": "VisualEditor_80dc0a36"
-        },
-        {
-            "type": "java",
-            "name": "MySwingApp",
-            "request": "launch",
-            "mainClass": "VisualEditor/com.example.swingapp.MySwingApp",
-            "projectName": "VisualEditor_80dc0a36"
-        },
-        {
-            "type": "java",
-            "name": "SwingApp",
-            "request": "launch",
-            "mainClass": "VisualEditor/com.example.swingapp.SwingApp",
-            "projectName": "VisualEditor_80dc0a36"
-        },
-        {
-            "type": "java",
-            "name": "Current File",
-            "request": "launch",
-            "mainClass": "${file}"
-        },
-        {
-            "type": "java",
-            "name": "MySwingApp",
-            "request": "launch",
-            "mainClass": "VisualEditor/com.example.swingapp.MySwingApp",
-            "projectName": "VisualEditor"
-        },
-        {
-            "type": "java",
-            "name": "SwingApp",
-            "request": "launch",
-            "mainClass": "VisualEditor/com.example.swingapp.SwingApp",
-            "projectName": "VisualEditor"
+            "modulePaths": [
+                "${workspaceFolder}/out"
+            ],
+            "classPaths": [],
+            "preLaunchTask": "Compile VisualEditor module",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
         }
     ]
 }

@@ -27,6 +27,8 @@ public class ToolBarShell {
     private ButtonGroup toolGroup = new ButtonGroup();
     private JComboBox<ModelType> modelSelector;
     private JComboBox<ReferenceKind> referenceSelector;
+    private ModelType activeModelType = ModelType.TASK_MODEL;
+    private boolean suppressModelSelectorEvents = false;
 
     private enum ModelType {
         TASK_MODEL("Task Model"),
@@ -121,7 +123,7 @@ public class ToolBarShell {
         JLabel modelLabel = new JLabel("Model:");
         modelSelector = new JComboBox<>(ModelType.values());
         modelSelector.setSelectedItem(ModelType.TASK_MODEL);
-        modelSelector.addActionListener(e -> rebuildModelTools((ModelType) modelSelector.getSelectedItem()));
+        modelSelector.addActionListener(e -> onModelSelectorChanged());
         toolBar.add(modelLabel);
         toolBar.add(modelSelector);
 
@@ -129,14 +131,7 @@ public class ToolBarShell {
         JButton clearBtn = new JButton("Clear");
         clearBtn.addActionListener(e -> canvas.clear());
         toolBar.add(clearBtn);
-
-        // Color chooser
-        JButton colorBtn = new JButton("Color");
-        colorBtn.addActionListener(e -> {
-            Color chosen = JColorChooser.showDialog(toolBar, "Choose drawing color", Color.BLACK);
-            if (chosen != null) canvas.setDrawColor(chosen);
-        });
-        toolBar.add(colorBtn);
+        
 
         // Delete tool
         JButton deleteBtn = new JButton("Delete");
@@ -294,14 +289,14 @@ public class ToolBarShell {
         JMenuItem saveItem = new JMenuItem("Export...");
         saveItem.addActionListener(e -> {
             JFileChooser chooser = new JFileChooser();
-            javax.swing.filechooser.FileNameExtensionFilter remodelFilter =
-                new javax.swing.filechooser.FileNameExtensionFilter("ReMoDeL files (*.remodel)", "remodel");
+            javax.swing.filechooser.FileNameExtensionFilter modFilter =
+                new javax.swing.filechooser.FileNameExtensionFilter("ReMoDeL models (*.mod)", "mod");
             javax.swing.filechooser.FileNameExtensionFilter xmlFilter =
                 new javax.swing.filechooser.FileNameExtensionFilter("XML files (*.xml)", "xml");
             javax.swing.filechooser.FileNameExtensionFilter jsonFilter =
                 new javax.swing.filechooser.FileNameExtensionFilter("JSON files (*.json)", "json");
 
-            chooser.setFileFilter(remodelFilter);
+            chooser.setFileFilter(modFilter);
             chooser.addChoosableFileFilter(xmlFilter);
             chooser.addChoosableFileFilter(jsonFilter);
             int res = chooser.showSaveDialog(parentFrame);
@@ -310,14 +305,15 @@ public class ToolBarShell {
                 String filePath = selected.getAbsolutePath();
                 String lowerPath = filePath.toLowerCase();
 
-                if (!lowerPath.endsWith(".json") && !lowerPath.endsWith(".xml") && !lowerPath.endsWith(".remodel")) {
+                if (!lowerPath.endsWith(".json") && !lowerPath.endsWith(".xml")
+                        && !lowerPath.endsWith(".mod") && !lowerPath.endsWith(".remodel")) {
                     javax.swing.filechooser.FileFilter chosenFilter = chooser.getFileFilter();
                     if (chosenFilter == jsonFilter) {
                         filePath = filePath + ".json";
                     } else if (chosenFilter == xmlFilter) {
                         filePath = filePath + ".xml";
                     } else {
-                        filePath = filePath + ".remodel";
+                        filePath = filePath + ".mod";
                     }
                 }
                 try {
@@ -410,8 +406,34 @@ public class ToolBarShell {
         return toolPanel;
     }
 
-    private ReMoDeLExporter.ModelKind currentModelKind() {
+    private void onModelSelectorChanged() {
+        if (suppressModelSelectorEvents) return;
+
         ModelType selected = (ModelType) modelSelector.getSelectedItem();
+        if (selected == null || selected == activeModelType) return;
+
+        if (canvas.hasDrawingContent()) {
+            suppressModelSelectorEvents = true;
+            modelSelector.setSelectedItem(activeModelType);
+            suppressModelSelectorEvents = false;
+
+            Window parent = SwingUtilities.getWindowAncestor(toolPanel);
+            JOptionPane.showMessageDialog(
+                parent,
+                "You cannot change the model type while the canvas has a drawing.\n"
+                    + "Use Clear or create a New file first.",
+                "Model Type Locked",
+                JOptionPane.WARNING_MESSAGE
+            );
+            return;
+        }
+
+        activeModelType = selected;
+        rebuildModelTools(selected);
+    }
+
+    private ReMoDeLExporter.ModelKind currentModelKind() {
+        ModelType selected = activeModelType;
         if (selected == null) return ReMoDeLExporter.ModelKind.TASK_MODEL;
         switch (selected) {
             case IMPACT_MODEL:
@@ -588,8 +610,8 @@ public class ToolBarShell {
                     g2.drawLine(cx + 2, cy + 3, cx + w - 6, cy + 3);
                     break;
                 case ENACTS:
-                    g2.drawLine(cx, cy + h / 2, cx + w, cy + h / 2);
-                    g2.fillOval(cx - 2, cy + h / 2 - 2, 5, 5);
+                    g2.drawLine(cx, cy + h / 2, cx + w - 3, cy + h / 2);
+                    g2.fillOval(cx + w - 2, cy + h / 2 - 2, 5, 5);
                     break;
                 case ACTOR:
                     g2.drawOval(cx + 5, cy, 6, 6);
@@ -648,31 +670,38 @@ public class ToolBarShell {
         }
 
         private void drawArrow(Graphics2D g2, int x1, int y1, int x2, int y2, boolean filled, boolean empty, boolean diamond) {
-            g2.drawLine(x1, y1, x2 - 4, y2);
             int hx = x2;
             int hy = y2;
             int size = 5;
             if (diamond) {
+                int len = 8;
+                int half = 4;
+                int rearX = hx - len;
+                g2.drawLine(x1, y1, rearX, y2);
+
                 Polygon p = new Polygon();
                 p.addPoint(hx, hy);
-                p.addPoint(hx - size, hy - size);
-                p.addPoint(hx - size * 2, hy);
-                p.addPoint(hx - size, hy + size);
+                p.addPoint(hx - half, hy - half);
+                p.addPoint(rearX, hy);
+                p.addPoint(hx - half, hy + half);
                 if (filled) g2.fill(p);
                 else g2.draw(p);
             } else if (empty) {
+                g2.drawLine(x1, y1, x2 - 4, y2);
                 Polygon p = new Polygon();
                 p.addPoint(hx, hy);
                 p.addPoint(hx - size, hy - size);
                 p.addPoint(hx - size, hy + size);
                 g2.draw(p);
             } else if (filled) {
+                g2.drawLine(x1, y1, x2 - 4, y2);
                 Polygon p = new Polygon();
                 p.addPoint(hx, hy);
                 p.addPoint(hx - size, hy - size);
                 p.addPoint(hx - size, hy + size);
                 g2.fill(p);
             } else {
+                g2.drawLine(x1, y1, x2 - 4, y2);
                 g2.drawLine(hx, hy, hx - size, hy - size);
                 g2.drawLine(hx, hy, hx - size, hy + size);
             }
