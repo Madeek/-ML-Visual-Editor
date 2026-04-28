@@ -500,24 +500,12 @@ public class ReMoDeLExporter {
             String source = stateTokenById.get(sourceId);
             String target = stateTokenById.get(targetId);
 
-            String[] textLines = splitLines(asText(connector.get("text")));
-            String transitionName = textLines.length == 0 || textLines[0].isBlank()
+            TransitionLabelParts labelParts = parseTransitionLabel(asText(connector.get("text")));
+            String transitionName = (labelParts.event == null || labelParts.event.isBlank())
                 ? defaultTransitionName(shape)
-                : textLines[0].trim();
-
-            String guardText = null;
-            String actionProc = null;
-            for (int i = 1; i < textLines.length; i++) {
-                String line = textLines[i] == null ? "" : textLines[i].trim();
-                if (line.isBlank()) continue;
-                if (guardText == null && (line.startsWith("[") || line.toLowerCase().startsWith("guard"))) {
-                    guardText = line;
-                    continue;
-                }
-                if (actionProc == null) {
-                    actionProc = line;
-                }
-            }
+                : labelParts.event.trim();
+            String guardText = labelParts.guard == null || labelParts.guard.isBlank() ? null : labelParts.guard.trim();
+            String actionProc = labelParts.action == null || labelParts.action.isBlank() ? null : labelParts.action.trim();
             if (actionProc == null && shouldGenerateDefaultAction(transitionName, shape)) {
                 actionProc = sanitizeIdentifier(transitionName);
             }
@@ -616,6 +604,46 @@ public class ReMoDeLExporter {
         if ("INITIAL_TRANSITION".equals(shapeType)) return "entry";
         if ("FINAL_TRANSITION".equals(shapeType)) return "exit";
         return "transition";
+    }
+
+    private static final class TransitionLabelParts {
+        final String event;
+        final String guard;
+        final String action;
+
+        TransitionLabelParts(String event, String guard, String action) {
+            this.event = event;
+            this.guard = guard;
+            this.action = action;
+        }
+    }
+
+    private static TransitionLabelParts parseTransitionLabel(String text) {
+        if (text == null) return new TransitionLabelParts("", "", "");
+
+        String normalized = text.trim().replaceAll("\\R+", " ").replaceAll("\\s+", " ");
+        if (normalized.isBlank()) return new TransitionLabelParts("", "", "");
+
+        String event = normalized;
+        String guard = "";
+        String action = "";
+
+        int actionSep = normalized.lastIndexOf(" / ");
+        if (actionSep >= 0) {
+            action = normalized.substring(actionSep + 3).trim();
+            normalized = normalized.substring(0, actionSep).trim();
+        }
+
+        int guardOpen = normalized.indexOf('[');
+        int guardClose = normalized.lastIndexOf(']');
+        if (guardOpen >= 0 && guardClose > guardOpen) {
+            guard = normalized.substring(guardOpen + 1, guardClose).trim();
+            event = normalized.substring(0, guardOpen).trim();
+        } else {
+            event = normalized.trim();
+        }
+
+        return new TransitionLabelParts(event, guard, action);
     }
 
     private static boolean shouldGenerateDefaultAction(String transitionName, String shapeType) {
@@ -1180,6 +1208,13 @@ public class ReMoDeLExporter {
         xml.append(space).append("  <from>").append(escape(connector.get("fromId").toString())).append("</from>\n");
         xml.append(space).append("  <to>").append(escape(connector.get("toId").toString())).append("</to>\n");
         xml.append(space).append("  <type>").append(escape(connector.get("shapeType").toString())).append("</type>\n");
+        if (connector.get("manualPosition") != null) {
+            xml.append(space).append("  <manualPosition>").append(escape(connector.get("manualPosition").toString())).append("</manualPosition>\n");
+        }
+        if (connector.get("x1") != null) xml.append(space).append("  <x1>").append(escape(connector.get("x1").toString())).append("</x1>\n");
+        if (connector.get("y1") != null) xml.append(space).append("  <y1>").append(escape(connector.get("y1").toString())).append("</y1>\n");
+        if (connector.get("x2") != null) xml.append(space).append("  <x2>").append(escape(connector.get("x2").toString())).append("</x2>\n");
+        if (connector.get("y2") != null) xml.append(space).append("  <y2>").append(escape(connector.get("y2").toString())).append("</y2>\n");
         xml.append(space).append("</connector>\n");
         return xml.toString();
     }
@@ -1220,7 +1255,23 @@ public class ReMoDeLExporter {
         json.append(space).append("  \"id\": \"").append(connector.getId()).append("\",\n");
         json.append(space).append("  \"from\": \"").append(connector.get("fromId")).append("\",\n");
         json.append(space).append("  \"to\": \"").append(connector.get("toId")).append("\",\n");
-        json.append(space).append("  \"type\": \"").append(connector.get("shapeType")).append("\"\n");
+        json.append(space).append("  \"type\": \"").append(connector.get("shapeType")).append("\"");
+        if (connector.get("manualPosition") != null) {
+            json.append(",\n").append(space).append("  \"manualPosition\": ").append(connector.get("manualPosition"));
+        }
+        if (connector.get("x1") != null) {
+            json.append(",\n").append(space).append("  \"x1\": ").append(connector.get("x1"));
+        }
+        if (connector.get("y1") != null) {
+            json.append(",\n").append(space).append("  \"y1\": ").append(connector.get("y1"));
+        }
+        if (connector.get("x2") != null) {
+            json.append(",\n").append(space).append("  \"x2\": ").append(connector.get("x2"));
+        }
+        if (connector.get("y2") != null) {
+            json.append(",\n").append(space).append("  \"y2\": ").append(connector.get("y2"));
+        }
+        json.append("\n");
         json.append(space).append("}");
         return json.toString();
     }

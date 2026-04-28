@@ -1,32 +1,65 @@
 package com.example.swingapp.view;
 
-import javax.swing.*;
+import java.awt.BasicStroke;
+import java.awt.BorderLayout;
+import java.awt.Color;
+import java.awt.Component;
+import java.awt.Cursor;
+import java.awt.Graphics;
+import java.awt.Graphics2D;
+import java.awt.GridLayout;
+import java.awt.Polygon;
+import java.awt.RenderingHints;
+import java.awt.Stroke;
+import java.awt.Toolkit;
+import java.awt.Window;
+import java.awt.geom.AffineTransform;
+import java.awt.geom.Area;
+import java.awt.geom.RoundRectangle2D;
+import java.awt.event.KeyEvent;
+import java.awt.event.InputEvent;
+import java.beans.PropertyChangeEvent;
+import java.beans.PropertyChangeListener;
+import java.io.File;
+import java.util.HashMap;
+import java.util.Map;
+
+import javax.swing.ButtonGroup;
+import javax.swing.Icon;
+import javax.swing.JButton;
+import javax.swing.JCheckBoxMenuItem;
+import javax.swing.JComboBox;
+import javax.swing.JComponent;
+import javax.swing.JFileChooser;
+import javax.swing.JFrame;
+import javax.swing.JLabel;
+import javax.swing.JMenu;
+import javax.swing.JMenuBar;
+import javax.swing.JMenuItem;
+import javax.swing.JOptionPane;
+import javax.swing.JPanel;
+import javax.swing.JSpinner;
+import javax.swing.JToggleButton;
+import javax.swing.JToolBar;
+import javax.swing.SpinnerNumberModel;
+import javax.swing.KeyStroke;
+import javax.swing.SwingUtilities;
 
 import com.example.swingapp.model.ReMoDeLModel;
 import com.example.swingapp.persistence.ReMoDeLExporter;
 
-import java.awt.*;
-import java.awt.event.KeyEvent;
-import java.awt.event.MouseAdapter;
-import java.awt.event.MouseEvent;
-import java.awt.event.FocusAdapter;
-import java.awt.event.FocusEvent;
-import java.io.File;
-import java.util.HashMap;
-import java.util.Map;
-import java.beans.PropertyChangeEvent;
-import java.beans.PropertyChangeListener;
-
 public class ToolBarShell {
     private final JPanel toolPanel;
     private final JToolBar toolBar;
-    private MouseAdapter textPlacer;
     private final JToolBar bottomBar;
     private final DrawingCanvas canvas;
     private final Map<DrawingCanvas.Tool, JToggleButton> toolButtons = new HashMap<>();
     private ButtonGroup toolGroup = new ButtonGroup();
     private JComboBox<ModelType> modelSelector;
     private JComboBox<ReferenceKind> referenceSelector;
+    private JSpinner objectTypeCountSpinner;
+    private JLabel zoomValueLabel;
+    private File currentDrawingFile;
     private ModelType activeModelType = ModelType.TASK_MODEL;
     private boolean suppressModelSelectorEvents = false;
 
@@ -51,7 +84,7 @@ public class ToolBarShell {
 
     private enum IconKind {
         SELECT,
-        TEXT,
+        PAN,
         RECT,
         OVAL,
         ROUND_RECT,
@@ -119,7 +152,8 @@ public class ToolBarShell {
     private void init() {
         canvas.setReferenceDefaultName("member");
         canvas.setReferenceQualifier("");
-        // Model selector (switches tool sets)
+
+        // Model selector 
         JLabel modelLabel = new JLabel("Model:");
         modelSelector = new JComboBox<>(ModelType.values());
         modelSelector.setSelectedItem(ModelType.TASK_MODEL);
@@ -131,12 +165,6 @@ public class ToolBarShell {
         JButton clearBtn = new JButton("Clear");
         clearBtn.addActionListener(e -> canvas.clear());
         toolBar.add(clearBtn);
-        
-
-        // Delete tool
-        JButton deleteBtn = new JButton("Delete");
-        deleteBtn.addActionListener(e -> canvas.deleteSelectedShape());
-        toolBar.add(deleteBtn);
 
         // Selection tool (default) - use toggle buttons for tools so selection is visible
         JToggleButton selectBtn = new JToggleButton("Select", new ToolIcon(IconKind.SELECT));
@@ -146,69 +174,46 @@ public class ToolBarShell {
         selectBtn.setSelected(true);
         toolBar.add(selectBtn);
 
-        // Textbox tool
-        JToggleButton textBtn = new JToggleButton("Text", new ToolIcon(IconKind.TEXT));
-        textBtn.addActionListener(e -> canvas.setCurrentTool(DrawingCanvas.Tool.TEXT));
-        toolGroup.add(textBtn);
-        toolButtons.put(DrawingCanvas.Tool.TEXT, textBtn);
-        toolBar.add(textBtn);
+        // Pan tool (drag-move entity and its attached connectors)
+        JToggleButton panBtn = new JToggleButton("Pan", new ToolIcon(IconKind.PAN));
+        panBtn.addActionListener(e -> canvas.setCurrentTool(DrawingCanvas.Tool.PAN));
+        toolGroup.add(panBtn);
+        toolButtons.put(DrawingCanvas.Tool.PAN, panBtn);
+        toolBar.add(panBtn);
+
+        toolBar.addSeparator();
+        toolBar.add(new JLabel("Zoom:"));
+
+        JButton zoomOutBtn = new JButton("-");
+        zoomOutBtn.setFocusable(false);
+        zoomOutBtn.setToolTipText("Zoom out");
+        zoomOutBtn.addActionListener(e -> canvas.zoomOut());
+        toolBar.add(zoomOutBtn);
+
+        JButton zoomInBtn = new JButton("+");
+        zoomInBtn.setFocusable(false);
+        zoomInBtn.setToolTipText("Zoom in");
+        zoomInBtn.addActionListener(e -> canvas.zoomIn());
+        toolBar.add(zoomInBtn);
+
+        zoomValueLabel = new JLabel();
+        zoomValueLabel.setToolTipText("Current zoom level");
+        toolBar.add(zoomValueLabel);
+        updateZoomLabel(canvas.getZoomScale());
+
+        canvas.addPropertyChangeListener("zoomScale", new PropertyChangeListener() {
+            @Override
+            public void propertyChange(PropertyChangeEvent evt) {
+                Object value = evt.getNewValue();
+                if (value instanceof Number) {
+                    updateZoomLabel(((Number) value).doubleValue());
+                }
+            }
+        });
+
 
         // initial tool set
         rebuildModelTools(ModelType.TASK_MODEL);
-
-        // prepare text placer adapter (creates a JTextField at click point and commits on Enter/focus lost)
-        textPlacer = new MouseAdapter() {
-            @Override
-            public void mousePressed(MouseEvent e) {
-                // only react to left-click when TEXT tool is active
-                if (SwingUtilities.isLeftMouseButton(e) && canvas.getCurrentTool() == DrawingCanvas.Tool.TEXT) {
-                    final JTextField tf = new JTextField(20);
-                    // ensure absolute positioning: if canvas has a layout, switch to null layout for absolute placement
-                    if (canvas.getLayout() != null) {
-                        canvas.setLayout(null);
-                    }
-                    int prefW = 160;
-                    int prefH = 24;
-                    int x = e.getX();
-                    int y = e.getY();
-                    tf.setBounds(x, y, prefW, prefH);
-                    // show border and background
-                    tf.setOpaque(false);
-                    tf.setBackground(Color.WHITE);
-                    tf.setForeground(canvas.getDrawColor());
-                    canvas.add(tf);
-                    canvas.revalidate();
-                    canvas.repaint();
-                    tf.requestFocusInWindow();
-                    tf.selectAll();
-
-                    // finish on Enter
-                    tf.addActionListener(ae -> finishTextField(tf));
-                    // finish on focus lost
-                    tf.addFocusListener(new FocusAdapter() {
-                        @Override
-                        public void focusLost(FocusEvent fe) {
-                            finishTextField(tf);
-                        }
-                    });
-                }
-            }
-
-            private void finishTextField(JTextField tf) {
-                String text = tf.getText();
-                Rectangle bounds = tf.getBounds();
-                Container parent = tf.getParent();
-                if (parent != null) {
-                    parent.remove(tf);
-                    if (text != null && !text.trim().isEmpty()) {
-                        // add text into the canvas model (as a shape record) so it participates
-                        canvas.addTextAt(text, bounds.x, bounds.y, bounds.width, bounds.height);
-                    }
-                    parent.revalidate();
-                    parent.repaint();
-                }
-            }
-        };
 
         // listen for canvas tool changes so toolbar highlights stay in sync
         canvas.addPropertyChangeListener("currentTool", new PropertyChangeListener() {
@@ -221,15 +226,11 @@ public class ToolBarShell {
                     if (btn != null && !btn.isSelected()) btn.setSelected(true);
 
                     // attach/remove text placer listener based on tool
-                    if (t == DrawingCanvas.Tool.TEXT) {
-                        canvas.addMouseListener(textPlacer);
-                        canvas.setCursor(Cursor.getPredefinedCursor(Cursor.TEXT_CURSOR));
-                    } else if (t == DrawingCanvas.Tool.SELECT) {
-                        canvas.removeMouseListener(textPlacer);
+                    if (t == DrawingCanvas.Tool.SELECT) {
                         canvas.setCursor(Cursor.getPredefinedCursor(Cursor.DEFAULT_CURSOR));
+                    } else if (t == DrawingCanvas.Tool.PAN) {
+                        canvas.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
                     } else {
-                        canvas.removeMouseListener(textPlacer);
-                        // restore default cursor
                         canvas.setCursor(Cursor.getPredefinedCursor(Cursor.DEFAULT_CURSOR));
                     }
                 }
@@ -237,53 +238,40 @@ public class ToolBarShell {
         });
     }
 
+    private void updateZoomLabel(double zoomScale) {
+        if (zoomValueLabel == null) return;
+        int percentage = (int) Math.round(zoomScale * 100.0);
+        zoomValueLabel.setText(percentage + "%");
+    }
+
     public JMenuBar createMenuBar(JFrame parentFrame) {
         JMenuBar menuBar = new JMenuBar();
+        int shortcutMask = Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx();
 
         // --- File menu
         JMenu fileMenu = new JMenu("File");
         JMenuItem newItem = new JMenuItem("New");
+        newItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_N, shortcutMask));
         newItem.addActionListener(e -> {
             // Clear the canvas for a new document
             canvas.clear();
+            currentDrawingFile = null;
         });
         fileMenu.add(newItem);
 
-        JMenuItem saveDrawingItem = new JMenuItem("Save...");
-        saveDrawingItem.addActionListener(e -> {
-            JFileChooser chooser = new JFileChooser();
-            chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("Drawing files (*.ser)", "ser"));
-            int res = chooser.showSaveDialog(parentFrame);
-            if (res == JFileChooser.APPROVE_OPTION) {
-                File file = chooser.getSelectedFile();
-                if (!file.getName().toLowerCase().endsWith(".ser")) {
-                    file = new File(file.getParentFile(), file.getName() + ".ser");
-                }
-                try {
-                    canvas.saveDrawing(file);
-                    JOptionPane.showMessageDialog(parentFrame, "Drawing saved successfully", "Success", JOptionPane.INFORMATION_MESSAGE);
-                } catch (Exception ex) {
-                    JOptionPane.showMessageDialog(parentFrame, "Error saving drawing: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
-                }
-            }
-        });
+        JMenuItem saveDrawingItem = new JMenuItem("Save");
+        saveDrawingItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_S, shortcutMask));
+        saveDrawingItem.addActionListener(e -> saveDrawing(parentFrame, false));
         fileMenu.add(saveDrawingItem);
 
+        JMenuItem saveDrawingAsItem = new JMenuItem("Save As...");
+        saveDrawingAsItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_S, shortcutMask | InputEvent.SHIFT_DOWN_MASK));
+        saveDrawingAsItem.addActionListener(e -> saveDrawing(parentFrame, true));
+        fileMenu.add(saveDrawingAsItem);
+
         JMenuItem openDrawingItem = new JMenuItem("Open...");
-        openDrawingItem.addActionListener(e -> {
-            JFileChooser chooser = new JFileChooser();
-            chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("Drawing files (*.ser)", "ser"));
-            int res = chooser.showOpenDialog(parentFrame);
-            if (res == JFileChooser.APPROVE_OPTION) {
-                File file = chooser.getSelectedFile();
-                try {
-                    canvas.loadDrawing(file);
-                    JOptionPane.showMessageDialog(parentFrame, "Drawing loaded successfully", "Success", JOptionPane.INFORMATION_MESSAGE);
-                } catch (Exception ex) {
-                    JOptionPane.showMessageDialog(parentFrame, "Error loading drawing: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
-                }
-            }
-        });
+        openDrawingItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_O, shortcutMask));
+        openDrawingItem.addActionListener(e -> openDrawing(parentFrame));
         fileMenu.add(openDrawingItem);
 
         JMenuItem saveItem = new JMenuItem("Export...");
@@ -324,7 +312,7 @@ public class ToolBarShell {
                         ReMoDeLExporter.exportToXML(model, filePath);
                     } else {
                         ReMoDeLExporter.exportToRemodelModel(model, filePath, currentModelKind());
-                    }         
+                    }
                     JOptionPane.showMessageDialog(parentFrame, "Model exported successfully", "Success", JOptionPane.INFORMATION_MESSAGE);
                 } catch (Exception ex) {
                     JOptionPane.showMessageDialog(parentFrame, "Error exporting: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
@@ -348,31 +336,43 @@ public class ToolBarShell {
         JMenuItem undoItem = new JMenuItem("Undo");
 
         // use platform menu shortcut (Ctrl on Win/Linux, Cmd on macOS)
-        undoItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_Z, Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()));
+        undoItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_Z, shortcutMask));
         undoItem.addActionListener(e -> canvas.undo());
         undoItem.setEnabled(canvas.canUndo());
         editMenu.add(undoItem);
 
         JMenuItem redoItem = new JMenuItem("Redo");
-        redoItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_Y, Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()));
+        redoItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_Y, shortcutMask));
         redoItem.addActionListener(e -> canvas.redo());
         redoItem.setEnabled(canvas.canRedo());
         editMenu.add(redoItem);
 
         editMenu.addSeparator();
 
+        JMenuItem selectAllItem = new JMenuItem("Select All");
+        selectAllItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_A, shortcutMask));
+        selectAllItem.addActionListener(e -> canvas.selectAllShapes());
+        editMenu.add(selectAllItem);
+
+        JMenuItem deleteItem = new JMenuItem("Delete");
+        deleteItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_BACK_SPACE, 0));
+        deleteItem.addActionListener(e -> canvas.deleteSelectedShape());
+        editMenu.add(deleteItem);
+
+        editMenu.addSeparator();
+
         JMenuItem copyItem = new JMenuItem("Copy");
-        copyItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_C, Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()));
+        copyItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_C, shortcutMask));
         copyItem.addActionListener(e -> canvas.copySelectedShape());
         editMenu.add(copyItem);
 
         JMenuItem cutItem = new JMenuItem("Cut");
-        cutItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_X, Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()));
+        cutItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_X, shortcutMask));
         cutItem.addActionListener(e -> canvas.cutSelectedShape());
         editMenu.add(cutItem);
 
         JMenuItem pasteItem = new JMenuItem("Paste");
-        pasteItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_V, Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()));
+        pasteItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_V, shortcutMask));
         pasteItem.addActionListener(e -> canvas.pasteClipboardShape());
         editMenu.add(pasteItem);
 
@@ -400,6 +400,44 @@ public class ToolBarShell {
         });
 
         return menuBar;
+    }
+
+    private void saveDrawing(JFrame parentFrame, boolean forceSaveAs) {
+        File target = currentDrawingFile;
+        if (forceSaveAs || target == null) {
+            JFileChooser chooser = new JFileChooser();
+            chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("Drawing files (*.ser)", "ser"));
+            int res = chooser.showSaveDialog(parentFrame);
+            if (res != JFileChooser.APPROVE_OPTION) return;
+            target = chooser.getSelectedFile();
+            if (!target.getName().toLowerCase().endsWith(".ser")) {
+                target = new File(target.getParentFile(), target.getName() + ".ser");
+            }
+        }
+
+        try {
+            canvas.saveDrawing(target);
+            currentDrawingFile = target;
+            JOptionPane.showMessageDialog(parentFrame, "Drawing saved successfully", "Success", JOptionPane.INFORMATION_MESSAGE);
+        } catch (Exception ex) {
+            JOptionPane.showMessageDialog(parentFrame, "Error saving drawing: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+        }
+    }
+
+    private void openDrawing(JFrame parentFrame) {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("Drawing files (*.ser)", "ser"));
+        int res = chooser.showOpenDialog(parentFrame);
+        if (res != JFileChooser.APPROVE_OPTION) return;
+
+        File file = chooser.getSelectedFile();
+        try {
+            canvas.loadDrawing(file);
+            currentDrawingFile = file;
+            JOptionPane.showMessageDialog(parentFrame, "Drawing loaded successfully", "Success", JOptionPane.INFORMATION_MESSAGE);
+        } catch (Exception ex) {
+            JOptionPane.showMessageDialog(parentFrame, "Error loading drawing: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+        }
     }
     
     public JComponent getToolBar() {
@@ -452,14 +490,13 @@ public class ToolBarShell {
 
     private void rebuildModelTools(ModelType type) {
         bottomBar.removeAll();
-        toolButtons.keySet().removeIf(t -> t != DrawingCanvas.Tool.SELECT && t != DrawingCanvas.Tool.TEXT);
+        toolButtons.keySet().removeIf(t -> t != DrawingCanvas.Tool.SELECT && t != DrawingCanvas.Tool.PAN && t != DrawingCanvas.Tool.TEXT);
+        toolButtons.keySet().removeIf(t -> t != DrawingCanvas.Tool.SELECT && t != DrawingCanvas.Tool.PAN);
         toolGroup = new ButtonGroup();
-
-        // re-add always-on tools to group so selection state works
         JToggleButton selectBtn = toolButtons.get(DrawingCanvas.Tool.SELECT);
-        JToggleButton textBtn = toolButtons.get(DrawingCanvas.Tool.TEXT);
+        JToggleButton panBtn = toolButtons.get(DrawingCanvas.Tool.PAN);
         if (selectBtn != null) toolGroup.add(selectBtn);
-        if (textBtn != null) toolGroup.add(textBtn);
+        if (panBtn != null) toolGroup.add(panBtn);
 
         switch (type) {
             case TASK_MODEL:
@@ -492,6 +529,17 @@ public class ToolBarShell {
                 break;
             case OBJECT_MODEL:
                 addToolButton(bottomBar, DrawingCanvas.Tool.OBJECT_TYPE, "Object Type", IconKind.OBJECT_TYPE);
+                bottomBar.add(new JLabel("Attrs:"));
+                objectTypeCountSpinner = new JSpinner(new SpinnerNumberModel(canvas.getObjectTypeAttributeCount(), 1, 50, 1));
+                objectTypeCountSpinner.setToolTipText("Number of attributes to create for a new Object Type");
+                ((JSpinner.DefaultEditor) objectTypeCountSpinner.getEditor()).getTextField().setColumns(3);
+                objectTypeCountSpinner.addChangeListener(e -> {
+                    Object value = objectTypeCountSpinner.getValue();
+                    if (value instanceof Number) {
+                        canvas.setObjectTypeAttributeCount(((Number) value).intValue());
+                    }
+                });
+                bottomBar.add(objectTypeCountSpinner);
                 addToolButton(bottomBar, DrawingCanvas.Tool.REFERENCE, "Reference", IconKind.REFERENCE);
                 addToolButton(bottomBar, DrawingCanvas.Tool.ARROW_EMPTY, "Generalisation", IconKind.ARROW_EMPTY);
                 addToolButton(bottomBar, DrawingCanvas.Tool.ARROW_DIAMOND, "Composition", IconKind.ARROW_DIAMOND);
@@ -561,20 +609,35 @@ public class ToolBarShell {
 
             switch (kind) {
                 case SELECT:
-                    // Cursor arrow icon
                     Polygon cursor = new Polygon();
-                    cursor.addPoint(cx + 1, cy + 1);
-                    cursor.addPoint(cx + 1, cy + h - 1);
-                    cursor.addPoint(cx + 5, cy + h - 5);
-                    cursor.addPoint(cx + 8, cy + h - 1);
-                    cursor.addPoint(cx + 10, cy + h - 3);
-                    cursor.addPoint(cx + 7, cy + h - 7);
-                    cursor.addPoint(cx + w - 1, cy + h - 7);
-                    g2.drawPolygon(cursor);
+                    cursor.addPoint(cx + 5, cy);
+                    cursor.addPoint(cx, cy + 12);
+                    cursor.addPoint(cx + 5, cy + 7);
+                    // cursor.addPoint(cx + 6, cy + 8);
+                    cursor.addPoint(cx + 10, cy + 12);
+
+                    g2.setColor(Color.WHITE);
+                    g2.fill(cursor);
+                    g2.setColor(new Color(40, 40, 40));
+                    g2.setStroke(new BasicStroke(1.2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                    g2.draw(cursor);
                     break;
-                case TEXT:
-                    g2.drawString("T", x + 6, y + 14);
+                case PAN: {
+                    Area hand = new Area(new RoundRectangle2D.Double(cx + 4, cy + 7, 8, 7, 3, 3));
+                    hand.add(new Area(new RoundRectangle2D.Double(cx + 5, cy + 1, 2, 8, 2, 2)));
+                    hand.add(new Area(new RoundRectangle2D.Double(cx + 8, cy + 1, 2, 9, 2, 2)));
+                    hand.add(new Area(new RoundRectangle2D.Double(cx + 11, cy + 3, 2, 6, 2, 2)));
+                    java.awt.Shape thumb = AffineTransform.getRotateInstance(-0.75, cx + 4, cy + 8)
+                        .createTransformedShape(new RoundRectangle2D.Double(cx + 1, cy + 6, 2, 7, 2, 2));
+                    hand.add(new Area(thumb));
+
+                    g2.setColor(Color.WHITE);
+                    g2.fill(hand);
+                    g2.setColor(new Color(40, 40, 40));
+                    g2.setStroke(new BasicStroke(1.8f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                    g2.draw(hand);
                     break;
+                }
                 case RECT:
                     g2.drawRect(cx, cy, w, h);
                     break;
@@ -610,8 +673,8 @@ public class ToolBarShell {
                     g2.drawLine(cx + 2, cy + 3, cx + w - 6, cy + 3);
                     break;
                 case ENACTS:
-                    g2.drawLine(cx, cy + h / 2, cx + w - 3, cy + h / 2);
-                    g2.fillOval(cx + w - 2, cy + h / 2 - 2, 5, 5);
+                    g2.drawLine(cx, cy + h / 2, cx + w , cy + h / 2);
+                    g2.fillOval(cx - 1, cy + h / 2 - 2, 5, 5);
                     break;
                 case ACTOR:
                     g2.drawOval(cx + 5, cy, 6, 6);
