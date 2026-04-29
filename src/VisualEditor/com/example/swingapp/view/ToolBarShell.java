@@ -57,6 +57,8 @@ public class ToolBarShell {
     private ButtonGroup toolGroup = new ButtonGroup();
     private JComboBox<ModelType> modelSelector;
     private JComboBox<ReferenceKind> referenceSelector;
+    private JComboBox<ImpactKind> impactSelector;
+    private JComboBox<DataflowKind> dataflowSelector;
     private JSpinner objectTypeCountSpinner;
     private JLabel zoomValueLabel;
     private File currentDrawingFile;
@@ -130,6 +132,52 @@ public class ToolBarShell {
         }
     }
 
+    private enum ImpactKind {
+        CREATE("create"),
+        READ("read"),
+        UPDATE("update"),
+        DELETE("delete");
+
+        private final String label;
+
+        ImpactKind(String label) {
+            this.label = label;
+        }
+
+        public String label() {
+            return label;
+        }
+
+        @Override
+        public String toString() {
+            return label;
+        }
+    }
+
+    private enum DataflowKind {
+        OBJECT("Object Dataflow", DrawingCanvas.DataflowKind.OBJECT),
+        CONTENT("Content Dataflow", DrawingCanvas.DataflowKind.CONTENT),
+        IDENTITY("Identity Dataflow", DrawingCanvas.DataflowKind.IDENTITY),
+        GENERAL_OBJECT("General Object Dataflow", DrawingCanvas.DataflowKind.GENERAL_OBJECT);
+
+        private final String label;
+        private final DrawingCanvas.DataflowKind canvasKind;
+
+        DataflowKind(String label, DrawingCanvas.DataflowKind canvasKind) {
+            this.label = label;
+            this.canvasKind = canvasKind;
+        }
+
+        public DrawingCanvas.DataflowKind canvasKind() {
+            return canvasKind;
+        }
+
+        @Override
+        public String toString() {
+            return label;
+        }
+    }
+
     public ToolBarShell(DrawingCanvas canvas) {
         this.canvas = canvas;
 
@@ -152,6 +200,8 @@ public class ToolBarShell {
     private void init() {
         canvas.setReferenceDefaultName("member");
         canvas.setReferenceQualifier("");
+        canvas.setImpactLabel("create");
+        canvas.setDataflowKind(DrawingCanvas.DataflowKind.OBJECT);
 
         // Model selector 
         JLabel modelLabel = new JLabel("Model:");
@@ -512,8 +562,16 @@ public class ToolBarShell {
             case IMPACT_MODEL:
                 addToolButton(bottomBar, DrawingCanvas.Tool.OVAL, "Task", IconKind.OVAL);
                 addToolButton(bottomBar, DrawingCanvas.Tool.RECTANGLE, "Object", IconKind.RECT);
-                addToolButton(bottomBar, DrawingCanvas.Tool.IMPACT, "Impact", IconKind.IMPACT);
                 addToolButton(bottomBar, DrawingCanvas.Tool.ARROW_EMPTY, "Generalisation", IconKind.ARROW_EMPTY);
+                addToolButton(bottomBar, DrawingCanvas.Tool.IMPACT, "Impact", IconKind.IMPACT);
+                impactSelector = new JComboBox<>(ImpactKind.values());
+                impactSelector.setSelectedItem(ImpactKind.CREATE);
+                canvas.setImpactLabel(ImpactKind.CREATE.label());
+                impactSelector.addActionListener(e -> {
+                    ImpactKind kind = (ImpactKind) impactSelector.getSelectedItem();
+                    canvas.setImpactLabel(kind != null ? kind.label() : ImpactKind.CREATE.label());
+                });
+                bottomBar.add(impactSelector);
                 break;
             case STATE_MODEL:
                 addToolButton(bottomBar, DrawingCanvas.Tool.STATE, "State", IconKind.STATE);
@@ -526,6 +584,14 @@ public class ToolBarShell {
             case PROCESS_MODEL:
                 addToolButton(bottomBar, DrawingCanvas.Tool.ROUNDED_RECTANGLE, "Process", IconKind.ROUND_RECT);
                 addToolButton(bottomBar, DrawingCanvas.Tool.ARROW_FILLED, "Dataflow", IconKind.ARROW_FILLED);
+                dataflowSelector = new JComboBox<>(DataflowKind.values());
+                dataflowSelector.setSelectedItem(DataflowKind.OBJECT);
+                canvas.setDataflowKind(DataflowKind.OBJECT.canvasKind());
+                dataflowSelector.addActionListener(e -> {
+                    DataflowKind kind = (DataflowKind) dataflowSelector.getSelectedItem();
+                    canvas.setDataflowKind(kind != null ? kind.canvasKind() : DataflowKind.OBJECT.canvasKind());
+                });
+                bottomBar.add(dataflowSelector);
                 break;
             case OBJECT_MODEL:
                 addToolButton(bottomBar, DrawingCanvas.Tool.OBJECT_TYPE, "Object Type", IconKind.OBJECT_TYPE);
@@ -540,11 +606,10 @@ public class ToolBarShell {
                     }
                 });
                 bottomBar.add(objectTypeCountSpinner);
-                addToolButton(bottomBar, DrawingCanvas.Tool.REFERENCE, "Reference", IconKind.REFERENCE);
                 addToolButton(bottomBar, DrawingCanvas.Tool.ARROW_EMPTY, "Generalisation", IconKind.ARROW_EMPTY);
                 addToolButton(bottomBar, DrawingCanvas.Tool.ARROW_DIAMOND, "Composition", IconKind.ARROW_DIAMOND);
                 bottomBar.addSeparator();
-                bottomBar.add(new JLabel("Reference:"));
+                addToolButton(bottomBar, DrawingCanvas.Tool.REFERENCE, "Reference", IconKind.REFERENCE);
                 referenceSelector = new JComboBox<>(ReferenceKind.values());
                 referenceSelector.setSelectedItem(ReferenceKind.PLAIN);
                 canvas.setReferenceQualifier("");

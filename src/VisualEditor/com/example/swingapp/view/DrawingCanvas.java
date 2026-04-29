@@ -60,6 +60,7 @@ import javax.swing.Box;
 import javax.swing.BoxLayout;
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
+import javax.swing.JComboBox;
 import javax.swing.InputMap;
 import javax.swing.JDialog;
 import javax.swing.JComponent;
@@ -86,6 +87,8 @@ public class DrawingCanvas extends JComponent {
     private float strokeWidth = 3f;
     private String referenceDefaultName = "member";
     private String referenceQualifier = "";
+    private String impactLabel = "create";
+    private DataflowKind dataflowKind = DataflowKind.OBJECT;
     private int lastX = -1, lastY = -1;
     private Consumer<String> statusConsumer = s -> {};
     private final UndoManager undoManager = new UndoManager();
@@ -329,6 +332,299 @@ public class DrawingCanvas extends JComponent {
         }
         redrawBuffer();
         repaint();
+    }
+
+    private String buildTransitionLabel(String event, String guard, String action) {
+        String safeEvent = event != null ? event.trim() : "";
+        String safeGuard = guard != null ? guard.trim() : "";
+        String safeAction = action != null ? action.trim() : "";
+
+        StringBuilder out = new StringBuilder();
+        if (!safeEvent.isEmpty()) {
+            out.append(safeEvent);
+        }
+        if (!safeGuard.isEmpty()) {
+            if (out.length() > 0) out.append(' ');
+            out.append('[').append(safeGuard).append(']');
+        }
+        if (!safeAction.isEmpty()) {
+            if (out.length() > 0) out.append(" / ");
+            out.append(safeAction);
+        }
+        return out.toString();
+    }
+
+    private String showTransitionEditorDialog(ShapeRecord sel) {
+        Window owner = SwingUtilities.getWindowAncestor(this);
+        final JDialog dialog = owner != null
+            ? new JDialog(owner, "Edit Transition", Dialog.ModalityType.APPLICATION_MODAL)
+            : new JDialog((java.awt.Frame) null, "Edit Transition", Dialog.ModalityType.APPLICATION_MODAL);
+        dialog.setDefaultCloseOperation(JDialog.DISPOSE_ON_CLOSE);
+
+        TransitionLabelParts initial = parseTransitionLabel(sel.text != null ? sel.text : getDefaultLabelForTool(sel.tool));
+
+        JPanel root = new JPanel(new BorderLayout(0, 10));
+        root.setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
+
+        JPanel form = new JPanel();
+        form.setLayout(new BoxLayout(form, BoxLayout.Y_AXIS));
+
+        JPanel eventRow = new JPanel(new BorderLayout(8, 0));
+        eventRow.add(new JLabel("Event:"), BorderLayout.WEST);
+        JTextField eventField = new JTextField(initial.event, 28);
+        eventRow.add(eventField, BorderLayout.CENTER);
+        form.add(eventRow);
+        form.add(Box.createVerticalStrut(10));
+
+        JPanel guardRow = new JPanel(new BorderLayout(8, 0));
+        guardRow.add(new JLabel("Guard:"), BorderLayout.WEST);
+        JTextField guardField = new JTextField(initial.guard, 28);
+        guardRow.add(guardField, BorderLayout.CENTER);
+        form.add(guardRow);
+        form.add(Box.createVerticalStrut(10));
+
+        JPanel actionRow = new JPanel(new BorderLayout(8, 0));
+        actionRow.add(new JLabel("Action:"), BorderLayout.WEST);
+        JTextArea actionField = new JTextArea(initial.action, 3, 28);
+        actionField.setLineWrap(true);
+        actionField.setWrapStyleWord(true);
+        actionRow.add(new JScrollPane(actionField), BorderLayout.CENTER);
+        form.add(actionRow);
+
+        JPanel buttonRow = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.RIGHT, 8, 0));
+        JButton cancelBtn = new JButton("Cancel");
+        JButton okBtn = new JButton("OK");
+        buttonRow.add(cancelBtn);
+        buttonRow.add(okBtn);
+
+        root.add(form, BorderLayout.CENTER);
+        root.add(buttonRow, BorderLayout.SOUTH);
+        dialog.setContentPane(root);
+
+        final boolean[] committed = { false };
+        final String[] result = { null };
+        okBtn.addActionListener(e -> {
+            committed[0] = true;
+            result[0] = buildTransitionLabel(eventField.getText(), guardField.getText(), actionField.getText());
+            dialog.dispose();
+        });
+        cancelBtn.addActionListener(e -> dialog.dispose());
+
+        dialog.getRootPane().setDefaultButton(okBtn);
+        dialog.pack();
+        dialog.setLocationRelativeTo(this);
+        eventField.selectAll();
+        dialog.setVisible(true);
+
+        if (!committed[0]) {
+            return null;
+        }
+        return result[0];
+    }
+
+    private static class ReferenceEditParts {
+        final String name;
+        final String qualifier;
+        final boolean underline;
+
+        ReferenceEditParts(String name, String qualifier, boolean underline) {
+            this.name = name;
+            this.qualifier = qualifier;
+            this.underline = underline;
+        }
+    }
+
+    private String buildReferenceLabel(String name, String qualifier, boolean underline) {
+        String safeName = name != null && !name.isBlank() ? name.trim() : referenceDefaultName;
+        if (safeName.isBlank()) safeName = "member";
+        StringBuilder out = new StringBuilder();
+        if (underline) out.append('*');
+        out.append(safeName);
+
+        String safeQualifier = qualifier != null ? qualifier.trim() : "";
+        if (!safeQualifier.isEmpty()) {
+            out.append("\n{").append(safeQualifier).append('}');
+        }
+        return out.toString();
+    }
+
+    private ReferenceEditParts parseReferenceParts(String text) {
+        String[] lines = text != null ? text.split("\\R", -1) : new String[0];
+        String name = referenceDefaultName;
+        String qualifier = referenceQualifier;
+        boolean underline = false;
+
+        if (lines.length > 0 && !lines[0].isBlank()) {
+            name = lines[0].trim();
+            if (name.startsWith("*")) {
+                underline = true;
+                name = name.substring(1).trim();
+            }
+        }
+
+        if (lines.length > 1 && !lines[1].isBlank()) {
+            qualifier = lines[1].trim();
+        }
+
+        if (qualifier.startsWith("{") && qualifier.endsWith("}") && qualifier.length() >= 2) {
+            qualifier = qualifier.substring(1, qualifier.length() - 1).trim();
+        }
+
+        return new ReferenceEditParts(name, qualifier, underline);
+    }
+
+    private String showReferenceEditorDialog(ShapeRecord sel) {
+        Window owner = SwingUtilities.getWindowAncestor(this);
+        final JDialog dialog = owner != null
+            ? new JDialog(owner, "Edit Reference", Dialog.ModalityType.APPLICATION_MODAL)
+            : new JDialog((java.awt.Frame) null, "Edit Reference", Dialog.ModalityType.APPLICATION_MODAL);
+        dialog.setDefaultCloseOperation(JDialog.DISPOSE_ON_CLOSE);
+
+        ReferenceEditParts initial = parseReferenceParts(sel.text != null ? sel.text : getDefaultLabelForTool(sel.tool));
+
+        JPanel root = new JPanel(new BorderLayout(0, 10));
+        root.setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
+
+        JPanel form = new JPanel();
+        form.setLayout(new BoxLayout(form, BoxLayout.Y_AXIS));
+
+        JPanel nameRow = new JPanel(new BorderLayout(8, 0));
+        nameRow.add(new JLabel("Reference name:"), BorderLayout.WEST);
+        JTextField nameField = new JTextField(initial.name, 28);
+        nameRow.add(nameField, BorderLayout.CENTER);
+        form.add(nameRow);
+        form.add(Box.createVerticalStrut(10));
+
+        JPanel qualifierRow = new JPanel(new BorderLayout(8, 0));
+        qualifierRow.add(new JLabel("Qualifier:"), BorderLayout.WEST);
+        JTextField qualifierField = new JTextField(initial.qualifier, 28);
+        qualifierRow.add(qualifierField, BorderLayout.CENTER);
+        form.add(qualifierRow);
+        form.add(Box.createVerticalStrut(10));
+
+        javax.swing.JCheckBox underlineBox = new javax.swing.JCheckBox("Underline reference name", initial.underline);
+        form.add(underlineBox);
+
+        JPanel buttonRow = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.RIGHT, 8, 0));
+        JButton cancelBtn = new JButton("Cancel");
+        JButton okBtn = new JButton("OK");
+        buttonRow.add(cancelBtn);
+        buttonRow.add(okBtn);
+
+        root.add(form, BorderLayout.CENTER);
+        root.add(buttonRow, BorderLayout.SOUTH);
+        dialog.setContentPane(root);
+
+        final boolean[] committed = { false };
+        final String[] result = { null };
+        okBtn.addActionListener(e -> {
+            committed[0] = true;
+            result[0] = buildReferenceLabel(nameField.getText(), qualifierField.getText(), underlineBox.isSelected());
+            dialog.dispose();
+        });
+        cancelBtn.addActionListener(e -> dialog.dispose());
+
+        dialog.getRootPane().setDefaultButton(okBtn);
+        dialog.pack();
+        dialog.setLocationRelativeTo(this);
+        nameField.selectAll();
+        dialog.setVisible(true);
+
+        if (!committed[0]) {
+            return null;
+        }
+        return result[0];
+    }
+
+    private String showImpactEditorDialog(ShapeRecord sel) {
+        Window owner = SwingUtilities.getWindowAncestor(this);
+        final JDialog dialog = owner != null
+            ? new JDialog(owner, "Edit Impact", Dialog.ModalityType.APPLICATION_MODAL)
+            : new JDialog((java.awt.Frame) null, "Edit Impact", Dialog.ModalityType.APPLICATION_MODAL);
+        dialog.setDefaultCloseOperation(JDialog.DISPOSE_ON_CLOSE);
+
+        String current = sel.text != null && !sel.text.isBlank() ? sel.text.trim() : getDefaultLabelForTool(sel.tool);
+        String[] options = new String[] { "create", "read", "update", "delete" };
+
+        JPanel root = new JPanel(new BorderLayout(0, 10));
+        root.setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
+        JPanel form = new JPanel(new BorderLayout(8, 8));
+        form.add(new JLabel("Impact kind:"), BorderLayout.WEST);
+        JComboBox<String> kindSelector = new JComboBox<>(options);
+        kindSelector.setSelectedItem(options[0]);
+        for (String option : options) {
+            if (option.equalsIgnoreCase(current)) {
+                kindSelector.setSelectedItem(option);
+                break;
+            }
+        }
+        form.add(kindSelector, BorderLayout.CENTER);
+
+        JPanel buttonRow = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.RIGHT, 8, 0));
+        JButton cancelBtn = new JButton("Cancel");
+        JButton okBtn = new JButton("OK");
+        buttonRow.add(cancelBtn);
+        buttonRow.add(okBtn);
+
+        root.add(form, BorderLayout.CENTER);
+        root.add(buttonRow, BorderLayout.SOUTH);
+        dialog.setContentPane(root);
+
+        final boolean[] committed = { false };
+        final String[] result = { null };
+        okBtn.addActionListener(e -> {
+            committed[0] = true;
+            Object selected = kindSelector.getSelectedItem();
+            result[0] = selected != null ? selected.toString() : null;
+            dialog.dispose();
+        });
+        cancelBtn.addActionListener(e -> dialog.dispose());
+
+        dialog.getRootPane().setDefaultButton(okBtn);
+        dialog.pack();
+        dialog.setLocationRelativeTo(this);
+        dialog.setVisible(true);
+
+        if (!committed[0]) return null;
+        return result[0];
+    }
+
+    private void startEditingImpactLabel(int index) {
+        if (index < 0 || index >= shapes.size()) return;
+        ShapeRecord sel = shapes.get(index);
+        if (sel.tool != Tool.IMPACT && sel.tool != Tool.ARROW_OPEN 
+            && sel.tool != Tool.ARROW_EMPTY && sel.tool != Tool.ARROW_DIAMOND) return;
+        if (isTransitionTool(sel.tool)) {
+            beginLabelEdit(index);
+            String newText = showTransitionEditorDialog(sel);
+            endLabelEdit();
+            if (newText == null) return;
+            updateShapeLabel(newText, index);
+            DrawingCanvas.this.revalidate();
+            DrawingCanvas.this.repaint();
+            return;
+        }
+        beginLabelEdit(index);
+        String newText = showImpactEditorDialog(sel);
+        endLabelEdit();
+        if (newText == null) return;
+        updateShapeLabel(newText, index);
+        DrawingCanvas.this.revalidate();
+        DrawingCanvas.this.repaint();
+    }
+
+    private void startEditingReferenceLabel(int index) {
+        if (index < 0 || index >= shapes.size()) return;
+        ShapeRecord sel = shapes.get(index);
+        if (sel.tool != Tool.REFERENCE) return;
+        beginLabelEdit(index);
+
+        String newText = showReferenceEditorDialog(sel);
+        endLabelEdit();
+        if (newText == null) return;
+        updateShapeLabel(newText, index);
+        DrawingCanvas.this.revalidate();
+        DrawingCanvas.this.repaint();
     }
 
     private static class ConnectorBranchGroup {
@@ -1100,6 +1396,14 @@ public class DrawingCanvas extends JComponent {
 
     public void setReferenceQualifier(String qualifier) {
         referenceQualifier = qualifier != null ? qualifier.trim() : "";
+    }
+
+    public void setImpactLabel(String label) {
+        impactLabel = label != null && !label.isBlank() ? label.trim() : "create";
+    }
+
+    public void setDataflowKind(DataflowKind kind) {
+        dataflowKind = kind != null ? kind : DataflowKind.OBJECT;
     }
 
     // selection/edit state
@@ -2196,10 +2500,12 @@ public class DrawingCanvas extends JComponent {
             startEditingShapeLabel(index);
         } else if (tool == Tool.OBJECT_TYPE) {
             startEditingObjectTypeLabel(index);
-        } else if (tool == Tool.IMPACT || tool == Tool.ARROW_OPEN || tool == Tool.ARROW_FILLED 
+        } else if (tool == Tool.IMPACT || tool == Tool.ARROW_OPEN 
                    || tool == Tool.ARROW_EMPTY || tool == Tool.ARROW_DIAMOND 
                    || tool == Tool.INITIAL_TRANSITION || tool == Tool.FINAL_TRANSITION) {
             startEditingImpactLabel(index);
+        } else if (tool == Tool.ARROW_FILLED) {
+            startEditingDataflowLabel(index);
         } else if (tool == Tool.REFERENCE) {
             startEditingReferenceLabel(index);
         }
@@ -2208,7 +2514,6 @@ public class DrawingCanvas extends JComponent {
     private void startEditingShapeLabel(int index) {
         if (index < 0 || index >= shapes.size()) return;
         ShapeRecord sel = shapes.get(index);
-        
         // Only editable shapes
         if (sel.tool != Tool.RECTANGLE && sel.tool != Tool.OVAL && 
             sel.tool != Tool.ROUNDED_RECTANGLE && sel.tool != Tool.STATE &&
@@ -2360,6 +2665,19 @@ public class DrawingCanvas extends JComponent {
         });
     }
 
+    private void startEditingDataflowLabel(int index) {
+        if (index < 0 || index >= shapes.size()) return;
+        ShapeRecord sel = shapes.get(index);
+        if (sel.tool != Tool.ARROW_FILLED) return;
+        beginLabelEdit(index);
+        String newText = showDataflowEditorDialog(sel);
+        endLabelEdit();
+        if (newText == null) return;
+        updateShapeLabel(newText, index);
+        DrawingCanvas.this.revalidate();
+        DrawingCanvas.this.repaint();
+    }
+
     private void startEditingObjectTypeLabel(int index) {
         if (index < 0 || index >= shapes.size()) return;
         ShapeRecord sel = shapes.get(index);
@@ -2376,156 +2694,154 @@ public class DrawingCanvas extends JComponent {
         DrawingCanvas.this.repaint();
     }
 
-    private void startEditingImpactLabel(int index) {
-        if (index < 0 || index >= shapes.size()) return;
-        ShapeRecord sel = shapes.get(index);
-        if (sel.tool != Tool.IMPACT && sel.tool != Tool.REFERENCE && sel.tool != Tool.ARROW_OPEN 
-            && sel.tool != Tool.ARROW_FILLED && sel.tool != Tool.ARROW_EMPTY && sel.tool != Tool.ARROW_DIAMOND) return;
-        beginLabelEdit(index);
+    // private void startEditingImpactLabel(int index) {
+    //     if (index < 0 || index >= shapes.size()) return;
+    //     ShapeRecord sel = shapes.get(index);
+    //     beginLabelEdit(index);
 
-        String currentText = sel.text != null ? sel.text : getDefaultLabelForTool(sel.tool);
-        if (isTransitionTool(sel.tool)) {
-            currentText = formatTransitionLabel(currentText);
-        }
-        Font font = zoomAwareEditorFont(sel.font);
+    //     String currentText = sel.text != null ? sel.text : getDefaultLabelForTool(sel.tool);
+    //     if (isTransitionTool(sel.tool)) {
+    //         currentText = formatTransitionLabel(currentText);
+    //     }
+    //     Font font = zoomAwareEditorFont(sel.font);
 
-        final JTextField tf = new JTextField(currentText);
-        tf.setOpaque(false);
-        tf.setBackground(new Color(0, 0, 0, 0));
-        tf.setForeground(sel.color != null ? sel.color : drawColor);
-        tf.setFont(font);
-        tf.setHorizontalAlignment(JTextField.CENTER);
-        styleInlineEditor(tf);
+    //     final JTextField tf = new JTextField(currentText);
+    //     tf.setOpaque(false);
+    //     tf.setBackground(new Color(0, 0, 0, 0));
+    //     tf.setForeground(sel.color != null ? sel.color : drawColor);
+    //     tf.setFont(font);
+    //     tf.setHorizontalAlignment(JTextField.CENTER);
+    //     styleInlineEditor(tf);
 
-        FontMetrics fm = getFontMetrics(font);
-        int textWidth = fm.stringWidth(currentText);
-        int textHeight = fm.getHeight();
-        int editorWidth = Math.max(60, textWidth + 20);
-        int editorHeight = Math.max(20, textHeight + 6);
-        int midX = (int) Math.round((sel.x1 + sel.x2) / 2.0);
-        int midY = (int) Math.round((sel.y1 + sel.y2) / 2.0);
+    //     FontMetrics fm = getFontMetrics(font);
+    //     int textWidth = fm.stringWidth(currentText);
+    //     int textHeight = fm.getHeight();
+    //     int editorWidth = Math.max(60, textWidth + 20);
+    //     int editorHeight = Math.max(20, textHeight + 6);
+    //     int midX = (int) Math.round((sel.x1 + sel.x2) / 2.0);
+    //     int midY = (int) Math.round((sel.y1 + sel.y2) / 2.0);
 
-        tf.setBounds(zoomedBounds(midX - editorWidth / 2.0, midY - editorHeight - 8, editorWidth, editorHeight));
+    //     tf.setBounds(zoomedBounds(midX - editorWidth / 2.0, midY - editorHeight - 8, editorWidth, editorHeight));
 
-        this.add(tf);
-        this.revalidate();
-        this.repaint();
-        tf.requestFocusInWindow();
-        tf.selectAll();
+    //     this.add(tf);
+    //     this.revalidate();
+    //     this.repaint();
+    //     tf.requestFocusInWindow();
+    //     tf.selectAll();
 
-        final boolean[] finished = {false};
-        Runnable finish = () -> {
-            if (finished[0]) return;
-            finished[0] = true;
-            String newText = tf.getText().trim();
-            if (newText.isEmpty()) newText = getDefaultLabelForTool(sel.tool);
-            DrawingCanvas.this.remove(tf);
-            endLabelEdit();
-            updateShapeLabel(newText, index);
-            DrawingCanvas.this.revalidate();
-            DrawingCanvas.this.repaint();
-        };
+    //     final boolean[] finished = {false};
+    //     Runnable finish = () -> {
+    //         if (finished[0]) return;
+    //         finished[0] = true;
+    //         String newText = tf.getText().trim();
+    //         if (newText.isEmpty()) newText = getDefaultLabelForTool(sel.tool);
+    //         DrawingCanvas.this.remove(tf);
+    //         endLabelEdit();
+    //         updateShapeLabel(newText, index);
+    //         DrawingCanvas.this.revalidate();
+    //         DrawingCanvas.this.repaint();
+    //     };
 
-        Runnable cancel = () -> {
-            finished[0] = true;
-            DrawingCanvas.this.remove(tf);
-            endLabelEdit();
-            DrawingCanvas.this.revalidate();
-            DrawingCanvas.this.repaint();
-        };
+    //     Runnable cancel = () -> {
+    //         finished[0] = true;
+    //         DrawingCanvas.this.remove(tf);
+    //         endLabelEdit();
+    //         DrawingCanvas.this.revalidate();
+    //         DrawingCanvas.this.repaint();
+    //     };
 
-        tf.getInputMap(JComponent.WHEN_FOCUSED).put(
-            KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0), "commit");
-        tf.getActionMap().put("commit", new AbstractAction() {
-            @Override public void actionPerformed(ActionEvent e) { finish.run(); }
-        });
+    //     tf.getInputMap(JComponent.WHEN_FOCUSED).put(
+    //         KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0), "commit");
+    //     tf.getActionMap().put("commit", new AbstractAction() {
+    //         @Override public void actionPerformed(ActionEvent e) { finish.run(); }
+    //     });
 
-        tf.getInputMap(JComponent.WHEN_FOCUSED).put(
-            KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), "cancel");
-        tf.getActionMap().put("cancel", new AbstractAction() {
-            @Override public void actionPerformed(ActionEvent e) { cancel.run(); }
-        });
+    //     tf.getInputMap(JComponent.WHEN_FOCUSED).put(
+    //         KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), "cancel");
+    //     tf.getActionMap().put("cancel", new AbstractAction() {
+    //         @Override public void actionPerformed(ActionEvent e) { cancel.run(); }
+    //     });
 
-        tf.addFocusListener(new FocusAdapter() {
-            @Override public void focusLost(FocusEvent e) {
-                finish.run();
-            }
-        });
-    }
+    //     tf.addFocusListener(new FocusAdapter() {
+    //         @Override public void focusLost(FocusEvent e) {
+    //             finish.run();
+    //         }
+    //     });
+    // }
 
-    private void startEditingReferenceLabel(int index) {
-        if (index < 0 || index >= shapes.size()) return;
-        ShapeRecord sel = shapes.get(index);
-        if (sel.tool != Tool.REFERENCE) return;
-        beginLabelEdit(index);
+    // private void startEditingReferenceLabel(int index) {
+    //     if (index < 0 || index >= shapes.size()) return;
+    //     ShapeRecord sel = shapes.get(index);
+    //     if (sel.tool != Tool.REFERENCE) return;
+    //     beginLabelEdit(index);
 
-        String currentText = sel.text != null ? sel.text : getDefaultLabelForTool(sel.tool);
-        Font font = zoomAwareEditorFont(sel.font);
+    //     String currentText = sel.text != null ? sel.text : getDefaultLabelForTool(sel.tool);
+    //     Font font = zoomAwareEditorFont(sel.font);
 
-        final JTextArea ta = new JTextArea(currentText);
-        ta.setLineWrap(true);
-        ta.setWrapStyleWord(true);
-        ta.setOpaque(false);
-        ta.setBackground(new Color(0, 0, 0, 0));
-        ta.setForeground(sel.color != null ? sel.color : drawColor);
-        ta.setFont(font);
-        styleInlineEditor(ta);
+    //     final JTextArea ta = new JTextArea(currentText);
+    //     ta.setLineWrap(true);
+    //     ta.setWrapStyleWord(true);
+    //     ta.setOpaque(false);
+    //     ta.setBackground(new Color(0, 0, 0, 0));
+    //     ta.setForeground(sel.color != null ? sel.color : drawColor);
+    //     ta.setFont(font);
+    //     styleInlineEditor(ta);
 
-        FontMetrics fm = getFontMetrics(font);
-        int textWidth = fm.stringWidth(currentText);
-        int textHeight = fm.getHeight();
-        int editorWidth = Math.max(80, textWidth + 20);
-        int editorHeight = Math.max(36, textHeight * 2 + 8);
-        int midX = (int) Math.round((sel.x1 + sel.x2) / 2.0);
-        int midY = (int) Math.round((sel.y1 + sel.y2) / 2.0);
+    //     FontMetrics fm = getFontMetrics(font);
+    //     int textWidth = fm.stringWidth(currentText);
+    //     int textHeight = fm.getHeight();
+    //     int editorWidth = Math.max(80, textWidth + 20);
+    //     int editorHeight = Math.max(36, textHeight * 2 + 8);
+    //     int midX = (int) Math.round((sel.x1 + sel.x2) / 2.0);
+    //     int midY = (int) Math.round((sel.y1 + sel.y2) / 2.0);
 
-        ta.setBounds(zoomedBounds(midX - editorWidth / 2.0, midY - editorHeight - 8, editorWidth, editorHeight));
+    //     ta.setBounds(zoomedBounds(midX - editorWidth / 2.0, midY - editorHeight - 8, editorWidth, editorHeight));
 
-        this.add(ta);
-        this.revalidate();
-        this.repaint();
-        ta.requestFocusInWindow();
-        ta.selectAll();
+    //     this.add(ta);
+    //     this.revalidate();
+    //     this.repaint();
+    //     ta.requestFocusInWindow();
+    //     ta.selectAll();
 
-        final boolean[] finished = {false};
-        Runnable finish = () -> {
-            if (finished[0]) return;
-            finished[0] = true;
-            String newText = ta.getText().trim();
-            if (newText.isEmpty()) newText = getDefaultLabelForTool(sel.tool);
-            DrawingCanvas.this.remove(ta);
-            endLabelEdit();
-            updateShapeLabel(newText, index);
-            DrawingCanvas.this.revalidate();
-            DrawingCanvas.this.repaint();
-        };
+    //     final boolean[] finished = {false};
+    //     Runnable finish = () -> {
+    //         if (finished[0]) return;
+    //         finished[0] = true;
+    //         String newText = ta.getText().trim();
+    //         if (newText.isEmpty()) newText = getDefaultLabelForTool(sel.tool);
+    //         DrawingCanvas.this.remove(ta);
+    //         endLabelEdit();
+    //         updateShapeLabel(newText, index);
+    //         DrawingCanvas.this.revalidate();
+    //         DrawingCanvas.this.repaint();
+    //     };
 
-        Runnable cancel = () -> {
-            finished[0] = true;
-            DrawingCanvas.this.remove(ta);
-            endLabelEdit();
-            DrawingCanvas.this.revalidate();
-            DrawingCanvas.this.repaint();
-        };
+    //     Runnable cancel = () -> {
+    //         finished[0] = true;
+    //         DrawingCanvas.this.remove(ta);
+    //         endLabelEdit();
+    //         DrawingCanvas.this.revalidate();
+    //         DrawingCanvas.this.repaint();
+    //     };
 
-        ta.getInputMap(JComponent.WHEN_FOCUSED).put(
-            KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, InputEvent.CTRL_DOWN_MASK), "commit");
-        ta.getActionMap().put("commit", new AbstractAction() {
-            @Override public void actionPerformed(ActionEvent e) { finish.run(); }
-        });
+    //     ta.getInputMap(JComponent.WHEN_FOCUSED).put(
+    //         KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, InputEvent.CTRL_DOWN_MASK), "commit");
+    //     ta.getActionMap().put("commit", new AbstractAction() {
+    //         @Override public void actionPerformed(ActionEvent e) { finish.run(); }
+    //     });
 
-        ta.getInputMap(JComponent.WHEN_FOCUSED).put(
-            KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), "cancel");
-        ta.getActionMap().put("cancel", new AbstractAction() {
-            @Override public void actionPerformed(ActionEvent e) { cancel.run(); }
-        });
+    //     ta.getInputMap(JComponent.WHEN_FOCUSED).put(
+    //         KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), "cancel");
+    //     ta.getActionMap().put("cancel", new AbstractAction() {
+    //         @Override public void actionPerformed(ActionEvent e) { cancel.run(); }
+    //     });
 
-        ta.addFocusListener(new FocusAdapter() {
-            @Override public void focusLost(FocusEvent e) {
-                finish.run();
-            }
-        });
-    }
+    //     ta.addFocusListener(new FocusAdapter() {
+    //         @Override public void focusLost(FocusEvent e) {
+    //             finish.run();
+    //         }
+    //     });
+    // }
 
     /**
      * Custom border that draws a rounded rectangle outline matching STATE shapes.
@@ -2598,11 +2914,11 @@ public class DrawingCanvas extends JComponent {
             case STATE: return "State";
             case LINE: return "Association";
             case AUTHORISATION: return "Authorisation";
-            case ARROW_FILLED: return "datum";
+            case ARROW_FILLED: return dataflowKind != null ? dataflowKind.defaultLabel() : DataflowKind.OBJECT.defaultLabel();
             case ARROW_OPEN: return "event";
             case INITIAL_TRANSITION: return "enter";
             case FINAL_TRANSITION: return "exit";
-            case IMPACT: return "create";
+            case IMPACT: return impactLabel != null && !impactLabel.isBlank() ? impactLabel : "create";
             case REFERENCE: {
                 if (referenceQualifier == null || referenceQualifier.isBlank()) return referenceDefaultName;
                 return referenceDefaultName + "\n{" + referenceQualifier + "}";
@@ -2621,6 +2937,201 @@ public class DrawingCanvas extends JComponent {
             this.guard = guard;
             this.action = action;
         }
+    }
+
+    public enum DataflowKind {
+        OBJECT("Object Dataflow", "Object"),
+        CONTENT("Content Dataflow", "Object {val}"),
+        IDENTITY("Identity Dataflow", "Object {id}"),
+        GENERAL_OBJECT("General Object Dataflow", "Object (Subtype)");
+
+        private final String label;
+        private final String defaultLabel;
+
+        DataflowKind(String label, String defaultLabel) {
+            this.label = label;
+            this.defaultLabel = defaultLabel;
+        }
+
+        public String defaultLabel() {
+            return defaultLabel;
+        }
+
+        @Override
+        public String toString() {
+            return label;
+        }
+    }
+
+    private static class DataflowEditParts {
+        final DataflowKind kind;
+        final String name;
+        final String subtypes;
+        final String annotation;
+
+        DataflowEditParts(DataflowKind kind, String name, String subtypes, String annotation) {
+            this.kind = kind;
+            this.name = name;
+            this.subtypes = subtypes;
+            this.annotation = annotation;
+        }
+    }
+
+    private DataflowEditParts parseDataflowParts(String text) {
+        String raw = text != null ? text.trim() : "";
+        if (raw.isBlank()) {
+            return new DataflowEditParts(DataflowKind.OBJECT, "Object", "", "");
+        }
+
+        String annotation = "";
+        if (raw.endsWith("{val}")) {
+            annotation = "{val}";
+            raw = raw.substring(0, raw.length() - 5).trim();
+        } else if (raw.endsWith("{id}")) {
+            annotation = "{id}";
+            raw = raw.substring(0, raw.length() - 4).trim();
+        }
+
+        String subtypes = "";
+        int open = raw.indexOf('(');
+        int close = raw.lastIndexOf(')');
+        if (open > 0 && close > open) {
+            subtypes = raw.substring(open + 1, close).trim();
+            raw = raw.substring(0, open).trim();
+        }
+
+        DataflowKind kind;
+        if (!subtypes.isEmpty()) {
+            kind = DataflowKind.GENERAL_OBJECT;
+        } else if ("{val}".equals(annotation)) {
+            kind = DataflowKind.CONTENT;
+        } else if ("{id}".equals(annotation)) {
+            kind = DataflowKind.IDENTITY;
+        } else {
+            kind = DataflowKind.OBJECT;
+        }
+
+        if (raw.isBlank()) raw = "Object";
+        return new DataflowEditParts(kind, raw, subtypes, annotation);
+    }
+
+    private String buildDataflowLabel(String name, String subtypes, DataflowKind kind, String annotation) {
+        String safeName = name != null && !name.isBlank() ? name.trim() : "Object";
+        String safeSubtypes = subtypes != null ? subtypes.trim() : "";
+        String safeAnnotation = annotation != null ? annotation.trim() : "";
+
+        switch (kind != null ? kind : DataflowKind.OBJECT) {
+            case CONTENT:
+                return safeName + " {val}";
+            case IDENTITY:
+                return safeName + " {id}";
+            case GENERAL_OBJECT:
+                StringBuilder out = new StringBuilder(safeName);
+                if (!safeSubtypes.isEmpty()) {
+                    out.append(" (").append(safeSubtypes).append(')');
+                }
+                if (!safeAnnotation.isEmpty()) {
+                    out.append(' ').append(safeAnnotation);
+                }
+                return out.toString();
+            case OBJECT:
+            default:
+                return safeName;
+        }
+    }
+
+    private String showDataflowEditorDialog(ShapeRecord sel) {
+        Window owner = SwingUtilities.getWindowAncestor(this);
+        final JDialog dialog = owner != null
+            ? new JDialog(owner, "Edit Dataflow", Dialog.ModalityType.APPLICATION_MODAL)
+            : new JDialog((java.awt.Frame) null, "Edit Dataflow", Dialog.ModalityType.APPLICATION_MODAL);
+        dialog.setDefaultCloseOperation(JDialog.DISPOSE_ON_CLOSE);
+
+        DataflowEditParts initial = parseDataflowParts(sel.text != null ? sel.text : getDefaultLabelForTool(sel.tool));
+
+        JPanel root = new JPanel(new BorderLayout(0, 10));
+        root.setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
+        JPanel form = new JPanel();
+        form.setLayout(new BoxLayout(form, BoxLayout.Y_AXIS));
+
+        JPanel kindRow = new JPanel(new BorderLayout(8, 0));
+        kindRow.add(new JLabel("Dataflow kind:"), BorderLayout.WEST);
+        JComboBox<DataflowKind> kindSelector = new JComboBox<>(DataflowKind.values());
+        kindSelector.setSelectedItem(initial.kind);
+        kindRow.add(kindSelector, BorderLayout.CENTER);
+        form.add(kindRow);
+        form.add(Box.createVerticalStrut(10));
+
+        JPanel nameRow = new JPanel(new BorderLayout(8, 0));
+        nameRow.add(new JLabel("Object name:"), BorderLayout.WEST);
+        JTextField nameField = new JTextField(initial.name, 26);
+        nameRow.add(nameField, BorderLayout.CENTER);
+        form.add(nameRow);
+        form.add(Box.createVerticalStrut(10));
+
+        JPanel subtypeRow = new JPanel(new BorderLayout(8, 0));
+        subtypeRow.add(new JLabel("Concrete subtypes:"), BorderLayout.WEST);
+        JTextField subtypeField = new JTextField(initial.subtypes, 26);
+        subtypeRow.add(subtypeField, BorderLayout.CENTER);
+        form.add(subtypeRow);
+        form.add(Box.createVerticalStrut(10));
+
+        JPanel annotationRow = new JPanel(new BorderLayout(8, 0));
+        annotationRow.add(new JLabel("Annotation:"), BorderLayout.WEST);
+        JComboBox<String> annotationSelector = new JComboBox<>(new String[] { "", "{id}", "{val}" });
+        annotationSelector.setSelectedItem(initial.annotation);
+        annotationRow.add(annotationSelector, BorderLayout.CENTER);
+        form.add(annotationRow);
+
+        Runnable syncFields = () -> {
+            DataflowKind selected = (DataflowKind) kindSelector.getSelectedItem();
+            boolean general = selected == DataflowKind.GENERAL_OBJECT;
+            subtypeField.setEnabled(general);
+            annotationSelector.setEnabled(general);
+            if (!general) {
+                if (selected == DataflowKind.CONTENT) {
+                    annotationSelector.setSelectedItem("{val}");
+                } else if (selected == DataflowKind.IDENTITY) {
+                    annotationSelector.setSelectedItem("{id}");
+                } else {
+                    annotationSelector.setSelectedItem("");
+                }
+            }
+        };
+        kindSelector.addActionListener(e -> syncFields.run());
+        syncFields.run();
+
+        JPanel buttonRow = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.RIGHT, 8, 0));
+        JButton cancelBtn = new JButton("Cancel");
+        JButton okBtn = new JButton("OK");
+        buttonRow.add(cancelBtn);
+        buttonRow.add(okBtn);
+
+        root.add(form, BorderLayout.CENTER);
+        root.add(buttonRow, BorderLayout.SOUTH);
+        dialog.setContentPane(root);
+
+        final boolean[] committed = { false };
+        final String[] result = { null };
+        okBtn.addActionListener(e -> {
+            committed[0] = true;
+            DataflowKind selectedKind = (DataflowKind) kindSelector.getSelectedItem();
+            String name = nameField.getText();
+            String subtypes = subtypeField.getText();
+            String annotation = (String) annotationSelector.getSelectedItem();
+            result[0] = buildDataflowLabel(name, subtypes, selectedKind, annotation);
+            dialog.dispose();
+        });
+        cancelBtn.addActionListener(e -> dialog.dispose());
+
+        dialog.getRootPane().setDefaultButton(okBtn);
+        dialog.pack();
+        dialog.setLocationRelativeTo(this);
+        nameField.selectAll();
+        dialog.setVisible(true);
+
+        if (!committed[0]) return null;
+        return result[0];
     }
 
     private TransitionLabelParts parseTransitionLabel(String text) {
@@ -4113,33 +4624,14 @@ public class DrawingCanvas extends JComponent {
         g.setFont(font);
         FontMetrics fm = g.getFontMetrics(font);
 
-        // Place near the lower-right interior of the loop so it stays inside
-        // the loop and out of the state body.
-        double angleDeg = 335.0;
-        double rad = Math.toRadians(angleDeg);
-        double rx = arc.getWidth() / 2.0;
-        double ry = arc.getHeight() / 2.0;
-        double cx = arc.getX() + rx;
-        double cy = arc.getY() + ry;
-
-        double px = cx + rx * Math.cos(rad);
-        double py = cy - ry * Math.sin(rad);
-
-        // Pull label inward from the arc along ellipse normal direction.
-        double nx = Math.cos(rad) / Math.max(1e-6, rx);
-        double ny = -Math.sin(rad) / Math.max(1e-6, ry);
-        double nLen = Math.hypot(nx, ny);
-        if (nLen > 1e-6) {
-            nx /= nLen;
-            ny /= nLen;
-        }
-        double offset = Math.max(16.0, fm.getHeight() * 0.9);
-        px -= nx * offset;
-        py -= ny * offset;
+        double cx = arc.getCenterX() + 10;
+        double cy = arc.getCenterY() + 10;
 
         int textWidth = fm.stringWidth(label);
-        float tx = (float) (px - textWidth / 2.0);
-        float ty = (float) (py + fm.getAscent() / 2.0);
+        int textHeight = fm.getAscent() - fm.getDescent();
+
+        float tx = (float) (cx - textWidth / 2.0);
+        float ty = (float) (cy + textHeight / 2.0);
         g.drawString(label, tx, ty);
     }
 
