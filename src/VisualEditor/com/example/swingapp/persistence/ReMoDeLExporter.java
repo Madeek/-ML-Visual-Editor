@@ -34,7 +34,7 @@ public class ReMoDeLExporter {
         }
     }
 
-    private static final Set<String> METAMODEL_NODE_TYPES = Set.of("OBJECT_TYPE", "RECTANGLE");
+    private static final Set<String> METAMODEL_NODE_TYPES = Set.of("OBJECT_TYPE", "OBJECT");
 
     private static class ConceptExport {
         final String id;
@@ -271,7 +271,7 @@ public class ReMoDeLExporter {
         List<ReMoDeLEntity> objectNodes = nodes.stream()
             .filter(n -> {
                 String shape = getShapeType(n);
-                return "OBJECT_TYPE".equals(shape) || "RECTANGLE".equals(shape);
+                return "OBJECT_TYPE".equals(shape) || "OBJECT".equals(shape);
             })
             .collect(Collectors.toList());
 
@@ -689,14 +689,14 @@ public class ReMoDeLExporter {
 
         switch (kind) {
             case IMPACT_MODEL:
-                collections.add(buildNodeCollection("tasks", "Task", nodes, nodeTokenById, prefixCounters, "t", "Task", "OVAL"));
-                collections.add(buildNodeCollection("objects", "Object", nodes, nodeTokenById, prefixCounters, "o", "Object", "RECTANGLE", "OBJECT_TYPE"));
+                collections.add(buildNodeCollection("tasks", "Task", nodes, nodeTokenById, prefixCounters, "t", "Task", "TASK"));
+                collections.add(buildNodeCollection("objects", "Object", nodes, nodeTokenById, prefixCounters, "o", "Object", "OBJECT", "OBJECT_TYPE"));
                 collections.add(buildConnectorCollection("impacts", "Impact", connectors, nodeTokenById, prefixCounters, "i", "IMPACT", false, ReMoDeLExporter::extractImpactKind));
                 collections.add(buildConnectorCollection("generalisations", "Generalisation", connectors, nodeTokenById, prefixCounters, "g", "ARROW_EMPTY", false, null));
                 collections.add(buildConnectorCollection("compositions", "Composition", connectors, nodeTokenById, prefixCounters, "c", "ARROW_DIAMOND", false, null));
                 break;
             case OBJECT_MODEL:
-                collections.add(buildNodeCollection("objectTypes", "ObjectType", nodes, nodeTokenById, prefixCounters, "o", "ObjectType", "OBJECT_TYPE", "RECTANGLE"));
+                collections.add(buildNodeCollection("objectTypes", "ObjectType", nodes, nodeTokenById, prefixCounters, "o", "ObjectType", "OBJECT_TYPE", "OBJECT"));
                 collections.add(buildConnectorCollection("references", "Reference", connectors, nodeTokenById, prefixCounters, "r", "REFERENCE", false, ReMoDeLExporter::extractReferenceKind));
                 collections.add(buildConnectorCollection("compositions", "Composition", connectors, nodeTokenById, prefixCounters, "c", "ARROW_DIAMOND", false, null));
                 collections.add(buildConnectorCollection("generalisations", "Generalisation", connectors, nodeTokenById, prefixCounters, "g", "ARROW_EMPTY", false, null));
@@ -708,13 +708,14 @@ public class ReMoDeLExporter {
                 collections.add(buildConnectorCollection("authorisations", "Authorisation", connectors, nodeTokenById, prefixCounters, "au", "AUTHORISATION", false, null));
                 break;
             case PROCESS_MODEL:
-                collections.add(buildNodeCollection("processes", "Process", nodes, nodeTokenById, prefixCounters, "p", "Process", "ROUNDED_RECTANGLE"));
+                collections.add(buildProcessCollection(nodes, nodeTokenById, prefixCounters));
+                collections.add(buildActionCollection(nodes, nodeTokenById, prefixCounters));
                 collections.add(buildConnectorCollection("dataflows", "Dataflow", connectors, nodeTokenById, prefixCounters, "f", "ARROW_FILLED", false, null));
                 break;
             case TASK_MODEL:
             default:
                 collections.add(buildNodeCollection("actors", "Actor", nodes, nodeTokenById, prefixCounters, "a", "Actor", "ACTOR"));
-                collections.add(buildNodeCollection("tasks", "Task", nodes, nodeTokenById, prefixCounters, "t", "Task", "OVAL", "SYSTEM", "BOUNDARY"));
+                collections.add(buildNodeCollection("tasks", "Task", nodes, nodeTokenById, prefixCounters, "t", "Task", "TASK", "SYSTEM", "BOUNDARY"));
                 collections.add(buildConnectorCollection("associations", "Association", connectors, nodeTokenById, prefixCounters, "a", "LINE", false, null));
                 collections.add(buildConnectorCollection("associations", "Association", connectors, nodeTokenById, prefixCounters, "a", "ENACTS", true, null));
                 collections.add(buildConnectorCollection("compositions", "Composition", connectors, nodeTokenById, prefixCounters, "c", "ARROW_DIAMOND", false, null));
@@ -864,6 +865,135 @@ public class ReMoDeLExporter {
         return collection;
     }
 
+    private static ModCollection buildActionCollection(
+            List<ReMoDeLEntity> nodes,
+            Map<String, String> nodeTokenById,
+            Map<String, Integer> prefixCounters) {
+
+        ModCollection collection = new ModCollection("actions", "Action");
+        int unnamedCount = 0;
+        for (ReMoDeLEntity node : nodes) {
+            if (!"ACTION".equals(getShapeType(node))) continue;
+
+            String token = nextToken(prefixCounters, "a");
+            nodeTokenById.put(node.getId(), token);
+
+            ActionLabelParts parts = parseActionLabel(asText(node.get("text")));
+            String name = parts.name;
+            if (name == null || name.isBlank()) {
+                unnamedCount++;
+                name = parts.kind.displayLabel() + " " + unnamedCount;
+            }
+
+            java.util.LinkedHashMap<String, ModValue> fields = new java.util.LinkedHashMap<>();
+            fields.put("name", new ModValue(name, false));
+            fields.put("kind", new ModValue(parts.kind.dslKind(), false));
+            collection.entries.add(buildEntry(token, "Action", fields));
+        }
+        return collection;
+    }
+
+    private static ModCollection buildProcessCollection(
+            List<ReMoDeLEntity> nodes,
+            Map<String, String> nodeTokenById,
+            Map<String, Integer> prefixCounters) {
+
+        ModCollection collection = new ModCollection("processes", "Process");
+        int unnamedCount = 0;
+        for (ReMoDeLEntity node : nodes) {
+            if (!"PROCESS".equals(getShapeType(node))) continue;
+
+            String token = nextToken(prefixCounters, "p");
+            nodeTokenById.put(node.getId(), token);
+
+            String name = firstLine(asText(node.get("text")));
+            if (name == null || name.isBlank()) {
+                unnamedCount++;
+                name = "Process " + unnamedCount;
+            }
+
+            java.util.LinkedHashMap<String, ModValue> fields = new java.util.LinkedHashMap<>();
+            fields.put("name", new ModValue(name, false));
+            collection.entries.add(buildEntry(token, "Process", fields));
+        }
+        return collection;
+    }
+
+    private static ActionLabelParts parseActionLabel(String label) {
+        String raw = label != null ? label.trim() : "";
+        if (raw.isBlank()) {
+            return new ActionLabelParts(ActionKind.INPUT, "");
+        }
+
+        for (ActionKind kind : ActionKind.values()) {
+            String kindLabel = kind.displayLabel;
+            if (raw.equalsIgnoreCase(kindLabel)) {
+                return new ActionLabelParts(kind, "");
+            }
+            if (raw.regionMatches(true, 0, kindLabel + ":", 0, kindLabel.length() + 1)) {
+                return new ActionLabelParts(kind, raw.substring(kindLabel.length() + 1).trim());
+            }
+        }
+
+        int colon = raw.indexOf(':');
+        if (colon > 0) {
+            String left = raw.substring(0, colon).trim();
+            String right = raw.substring(colon + 1).trim();
+            for (ActionKind kind : ActionKind.values()) {
+                if (left.equalsIgnoreCase(kind.displayLabel) || left.equalsIgnoreCase(kind.dslKind)) {
+                    return new ActionLabelParts(kind, right);
+                }
+            }
+        }
+
+        String lower = raw.toLowerCase();
+        ActionKind inferred = ActionKind.INPUT;
+        if (lower.contains("output")) inferred = ActionKind.OUTPUT;
+        else if (lower.contains("fetch")) inferred = ActionKind.FETCH;
+        else if (lower.contains("store")) inferred = ActionKind.STORE;
+        else if (lower.contains("create")) inferred = ActionKind.CREATE;
+        else if (lower.contains("update")) inferred = ActionKind.UPDATE;
+        else if (lower.contains("delete") || lower.contains("archive") || lower.contains("remove")) inferred = ActionKind.DELETE;
+
+        return new ActionLabelParts(inferred, raw);
+    }
+
+    private static class ActionLabelParts {
+        final ActionKind kind;
+        final String name;
+
+        ActionLabelParts(ActionKind kind, String name) {
+            this.kind = kind;
+            this.name = name;
+        }
+    }
+
+    private enum ActionKind {
+        INPUT("InputAction", "input"),
+        OUTPUT("OutputAction", "output"),
+        FETCH("FetchAction", "fetch"),
+        STORE("StoreAction", "store"),
+        CREATE("CreateAction", "create"),
+        UPDATE("UpdateAction", "update"),
+        DELETE("DeleteAction", "delete");
+
+        final String displayLabel;
+        final String dslKind;
+
+        ActionKind(String displayLabel, String dslKind) {
+            this.displayLabel = displayLabel;
+            this.dslKind = dslKind;
+        }
+
+        String displayLabel() {
+            return displayLabel;
+        }
+
+        String dslKind() {
+            return dslKind;
+        }
+    }
+
     private static void extractReferenceKind(ReMoDeLEntity connector, java.util.LinkedHashMap<String, ModValue> fields) {
         String label = asText(connector.get("text"));
         String second = secondLine(label);
@@ -953,7 +1083,7 @@ public class ReMoDeLExporter {
                 preferredShape = "SYSTEM";
                 break;
             case PROCESS_MODEL:
-                preferredShape = "ROUNDED_RECTANGLE";
+                preferredShape = "PROCESS";
                 break;
             case STATE_MODEL:
                 preferredShape = "STATE";
@@ -963,7 +1093,7 @@ public class ReMoDeLExporter {
                 break;
             case IMPACT_MODEL:
             default:
-                preferredShape = "OVAL";
+                preferredShape = "TASK";
                 break;
         }
 

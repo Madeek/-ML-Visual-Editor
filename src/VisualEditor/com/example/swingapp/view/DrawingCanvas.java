@@ -71,6 +71,7 @@ import javax.swing.JTextArea;
 import javax.swing.JTextField;
 import javax.swing.KeyStroke;
 import javax.swing.SwingUtilities;
+import javax.swing.JCheckBox;
 import javax.swing.text.JTextComponent;
 import javax.swing.undo.AbstractUndoableEdit;
 import javax.swing.undo.UndoManager;
@@ -89,6 +90,9 @@ public class DrawingCanvas extends JComponent {
     private String referenceQualifier = "";
     private String impactLabel = "create";
     private DataflowKind dataflowKind = DataflowKind.OBJECT;
+    private ProcessActionKind processActionKind = ProcessActionKind.INPUT;
+    private String documentModelTypeName = "TASK_MODEL";
+    private String loadedDocumentModelTypeName = null;
     private int lastX = -1, lastY = -1;
     private Consumer<String> statusConsumer = s -> {};
     private final UndoManager undoManager = new UndoManager();
@@ -664,7 +668,8 @@ public class DrawingCanvas extends JComponent {
             ShapeRecord from = findShapeByLocalId(r.anchorFromId);
             ShapeRecord to = findShapeByLocalId(r.anchorToId);
             if (from == null || to == null) continue;
-            String key = r.tool.name() + "|" + r.anchorToId;
+            String labelKey = r.text == null ? "" : r.text.trim().toLowerCase();
+            String key = r.tool.name() + "|" + r.anchorFromId + "|" + r.anchorToId + "|" + labelKey;
             buckets.computeIfAbsent(key, k -> new ArrayList<>()).add(i);
         }
 
@@ -945,7 +950,7 @@ public class DrawingCanvas extends JComponent {
         double dy = to.y - from.y;
         if (Math.abs(dx) < 1e-6 && Math.abs(dy) < 1e-6) return new Point2D.Double(from.x, from.y);
 
-        if (r.tool == Tool.OVAL) {
+        if (r.tool == Tool.TASK) {
             // Ellipse: solve parametric intersection
             double rx = b.getWidth() / 2.0;
             double ry = b.getHeight() / 2.0;
@@ -1041,9 +1046,9 @@ public class DrawingCanvas extends JComponent {
         int y1 = oy1 instanceof Number ? ((Number)oy1).intValue() : 10;
         int x2 = ox2 instanceof Number ? ((Number)ox2).intValue() : x1 + 80;
         int y2 = oy2 instanceof Number ? ((Number)oy2).intValue() : y1 + 40;
-        // determine tool from stored shapeType (fallback to RECTANGLE)
+        // determine tool from stored shapeType (fallback to OBJECT)
         String shapeTypeStr = e.get("shapeType") instanceof String ? (String)e.get("shapeType") : null;
-        Tool t = Tool.RECTANGLE;
+        Tool t = Tool.OBJECT;
         if (shapeTypeStr != null) {
             try {
                 t = Tool.valueOf(shapeTypeStr.toUpperCase());
@@ -1071,16 +1076,16 @@ public class DrawingCanvas extends JComponent {
             case REFERENCE:
                 s = new Line2D.Double(x1, y1, x2, y2);
                 break;
-            case OVAL:
+            case TASK:
                 s = new Ellipse2D.Double(rx, ry, rw, rh);
                 break;
-            case ROUNDED_RECTANGLE:
+            case ACTION:
                 s = new RoundRectangle2D.Double(rx, ry, rw, rh, Math.max(8, Math.min(rw, rh) / 4.0), Math.max(8, Math.min(rw, rh) / 4.0));
                 break;
             case ACTOR:
                 s = buildActorShape(rx, ry, rw, rh);
                 break;
-            case RECTANGLE:
+            case OBJECT:
             case OBJECT_TYPE:
             default:
                 s = new Rectangle2D.Double(rx, ry, rw, rh);
@@ -1319,7 +1324,7 @@ public class DrawingCanvas extends JComponent {
         ARROW_DIAMOND,          // Composition
         ARROW_OPEN,             // Event/Transition
         IMPACT, REFERENCE, ENACTS,
-        OVAL, RECTANGLE, ROUNDED_RECTANGLE, BOUNDARY, OBJECT_TYPE,
+        TASK, OBJECT, PROCESS, ACTION, BOUNDARY, OBJECT_TYPE,
         TEXT, STATE, ACTOR, SYSTEM, AUTHORISATION, 
         INITIAL_TRANSITION, FINAL_TRANSITION
     }
@@ -1339,6 +1344,15 @@ public class DrawingCanvas extends JComponent {
     // Model getter for external access (e.g., for save/export)
     public ReMoDeLModel getModel() {
         return model;
+    }
+
+    public void setDocumentModelTypeName(String modelTypeName) {
+        if (modelTypeName == null || modelTypeName.isBlank()) return;
+        documentModelTypeName = modelTypeName.trim();
+    }
+
+    public String getLoadedDocumentModelTypeName() {
+        return loadedDocumentModelTypeName;
     }
 
     /**
@@ -1377,12 +1391,6 @@ public class DrawingCanvas extends JComponent {
                 connector.put("fromId", fromId);
                 connector.put("toId", toId);
                 connector.put("manualPosition", false);
-            } else {
-                connector.put("manualPosition", true);
-                connector.put("x1", (int) Math.round(r.x1));
-                connector.put("y1", (int) Math.round(r.y1));
-                connector.put("x2", (int) Math.round(r.x2));
-                connector.put("y2", (int) Math.round(r.y2));
             }
             snapshot.addEntity(connector);
         }
@@ -1404,6 +1412,10 @@ public class DrawingCanvas extends JComponent {
 
     public void setDataflowKind(DataflowKind kind) {
         dataflowKind = kind != null ? kind : DataflowKind.OBJECT;
+    }
+
+    public void setProcessActionKind(ProcessActionKind kind) {
+        processActionKind = kind != null ? kind : ProcessActionKind.INPUT;
     }
 
     // selection/edit state
@@ -1632,20 +1644,27 @@ public class DrawingCanvas extends JComponent {
         return out.toString();
     }
 
-    private void rebuildObjectTypeAttributeRows(JPanel attributesPanel, java.util.List<JTextField> attributeFields, JDialog dialog) {
+    private void rebuildObjectTypeAttributeRows(JPanel attributesPanel, java.util.List<JTextField> attributeFields, java.util.List<JCheckBox> underlineChecks, JDialog dialog) {
         attributesPanel.removeAll();
         for (int i = 0; i < attributeFields.size(); i++) {
             JTextField field = attributeFields.get(i);
+            JCheckBox underline = underlineChecks.size() > i ? underlineChecks.get(i) : new JCheckBox("_");
             JPanel row = new JPanel(new BorderLayout(8, 0));
             row.add(new JLabel((i + 1) + "."), BorderLayout.WEST);
-            row.add(field, BorderLayout.CENTER);
+            JPanel center = new JPanel(new BorderLayout(6, 0));
+            center.add(field, BorderLayout.CENTER);
+            underline.setToolTipText("Underline attribute");
+            underline.setFocusable(false);
+            center.add(underline, BorderLayout.EAST);
+            row.add(center, BorderLayout.CENTER);
             JButton removeBtn = new JButton("-");
             removeBtn.setFocusable(false);
             final int removeIndex = i;
             removeBtn.addActionListener(e -> {
                 if (attributeFields.size() <= 1) return;
                 attributeFields.remove(removeIndex);
-                rebuildObjectTypeAttributeRows(attributesPanel, attributeFields, dialog);
+                underlineChecks.remove(removeIndex);
+                rebuildObjectTypeAttributeRows(attributesPanel, attributeFields, underlineChecks, dialog);
                 dialog.pack();
             });
             row.add(removeBtn, BorderLayout.EAST);
@@ -1683,11 +1702,19 @@ public class DrawingCanvas extends JComponent {
         JPanel attributesPanel = new JPanel();
         attributesPanel.setLayout(new BoxLayout(attributesPanel, BoxLayout.Y_AXIS));
         java.util.List<JTextField> attributeFields = new ArrayList<>();
+        java.util.List<JCheckBox> underlineChecks = new ArrayList<>();
 
         for (String attribute : initial.attributes) {
-            attributeFields.add(new JTextField(attribute, 24));
+            boolean under = false;
+            String a = attribute != null ? attribute : "";
+            if (a.startsWith("*")) {
+                under = true;
+                a = a.substring(1).trim();
+            }
+            attributeFields.add(new JTextField(a, 24));
+            underlineChecks.add(new JCheckBox("_", under));
         }
-        rebuildObjectTypeAttributeRows(attributesPanel, attributeFields, dialog);
+        rebuildObjectTypeAttributeRows(attributesPanel, attributeFields, underlineChecks, dialog);
 
         JScrollPane scrollPane = new JScrollPane(attributesPanel);
         scrollPane.setBorder(BorderFactory.createTitledBorder("Attributes"));
@@ -1698,7 +1725,8 @@ public class DrawingCanvas extends JComponent {
         JButton addBtn = new JButton("Add Attribute");
         addBtn.addActionListener(e -> {
             attributeFields.add(new JTextField("", 24));
-            rebuildObjectTypeAttributeRows(attributesPanel, attributeFields, dialog);
+            underlineChecks.add(new JCheckBox("_", false));
+            rebuildObjectTypeAttributeRows(attributesPanel, attributeFields, underlineChecks, dialog);
             dialog.pack();
         });
         JButton okBtn = new JButton("OK");
@@ -1717,9 +1745,16 @@ public class DrawingCanvas extends JComponent {
             committed[0] = true;
             String objectName = nameField.getText() != null ? nameField.getText().trim() : "";
             java.util.List<String> attributes = new ArrayList<>();
-            for (JTextField field : attributeFields) {
+            for (int i = 0; i < attributeFields.size(); i++) {
+                JTextField field = attributeFields.get(i);
                 String value = field.getText() != null ? field.getText().trim() : "";
-                if (!value.isEmpty()) attributes.add(value);
+                if (value.isEmpty()) continue;
+                JCheckBox cb = underlineChecks.size() > i ? underlineChecks.get(i) : null;
+                if (cb != null && cb.isSelected()) {
+                    attributes.add("*" + value);
+                } else {
+                    attributes.add(value);
+                }
             }
             if (objectName.isEmpty()) objectName = "Object";
             result[0] = buildObjectTypeLabel(objectName, attributes);
@@ -1751,9 +1786,10 @@ public class DrawingCanvas extends JComponent {
 
     // Fixed-size entities. Boundary remains resizable.
     private boolean isConstrainedSizeTool(Tool t) {
-        return t == Tool.RECTANGLE
-            || t == Tool.OVAL
-            || t == Tool.ROUNDED_RECTANGLE
+        return t == Tool.OBJECT
+            || t == Tool.TASK
+            || t == Tool.PROCESS
+            || t == Tool.ACTION
             || t == Tool.STATE
             || t == Tool.OBJECT_TYPE
             || t == Tool.SYSTEM
@@ -1959,9 +1995,13 @@ public class DrawingCanvas extends JComponent {
     private static class CanvasSnapshot implements Serializable {
         private static final long serialVersionUID = 1L;
         private final java.util.List<ShapeRecord> shapes;
+        private final double zoomScale;
+        private final String modelTypeName;
 
-        CanvasSnapshot(java.util.List<ShapeRecord> shapes) {
+        CanvasSnapshot(java.util.List<ShapeRecord> shapes, double zoomScale, String modelTypeName) {
             this.shapes = shapes;
+            this.zoomScale = zoomScale;
+            this.modelTypeName = modelTypeName;
         }
     }
 
@@ -2059,18 +2099,23 @@ public class DrawingCanvas extends JComponent {
                             if (sr.tool == Tool.TEXT) {
                                 startEditingText(hit);
                                 return;
+                            } else if (sr.tool == Tool.ACTION) {
+                                startEditingProcessActionLabel(hit);
+                                return;
                             }
-                                // Shape items (RECTANGLE, OVAL, ROUNDED_RECTANGLE, STATE, ACTOR, SYSTEM) get label editing
-                                else if (sr.tool == Tool.RECTANGLE || sr.tool == Tool.OVAL || 
-                                    sr.tool == Tool.ROUNDED_RECTANGLE || sr.tool == Tool.STATE
-                                    || sr.tool == Tool.ACTOR || sr.tool == Tool.SYSTEM
+                                // Shape items (OBJECT, TASK, PROCESS, STATE, ACTOR, SYSTEM) get label editing
+                                else if (sr.tool == Tool.OBJECT || sr.tool == Tool.TASK || sr.tool == Tool.PROCESS ||
+                                    sr.tool == Tool.STATE || sr.tool == Tool.ACTOR || sr.tool == Tool.SYSTEM
                                     || sr.tool == Tool.BOUNDARY) {
                                 startEditingShapeLabel(hit);
                                 return;
                             } else if (sr.tool == Tool.OBJECT_TYPE) {
                                 startEditingObjectTypeLabel(hit);
                                 return;
-                            } else if (sr.tool == Tool.IMPACT || sr.tool == Tool.ARROW_OPEN || sr.tool == Tool.ARROW_FILLED 
+                            } else if (sr.tool == Tool.ARROW_FILLED) {
+                                startEditingDataflowLabel(hit);
+                                return;
+                            } else if (sr.tool == Tool.IMPACT || sr.tool == Tool.ARROW_OPEN 
                                     || sr.tool == Tool.ARROW_EMPTY || sr.tool == Tool.ARROW_DIAMOND 
                                     || sr.tool == Tool.INITIAL_TRANSITION || sr.tool == Tool.FINAL_TRANSITION) {
                                 startEditingImpactLabel(hit);
@@ -2150,6 +2195,7 @@ public class DrawingCanvas extends JComponent {
                                 Shape rect = new Rectangle2D.Double(Math.min(nx1, nx2), Math.min(ny1, ny2), Math.abs(nx2 - nx1), Math.abs(ny2 - ny1));
                                 ShapeRecord nr = new ShapeRecord(Tool.TEXT, rect, sel.color, sel.stroke, nx1, ny1, nx2, ny2, sel.text, sel.font,
                                         sel.entityId, sel.localId, sel.anchorFromId, sel.anchorToId);
+                                nr = clampRecordWithinCanvas(nr);
                                 if (sel.entityId != null && model != null) {
                                     model.updateEntity(entityFromShape(nr));
                                 } else {
@@ -2161,6 +2207,7 @@ public class DrawingCanvas extends JComponent {
                                 ShapeRecord nr = new ShapeRecord(sel.tool, moved, sel.color, sel.stroke,
                                         sel.x1 + dx, sel.y1 + dy, sel.x2 + dx, sel.y2 + dy, sel.text, sel.font,
                                         sel.entityId, sel.localId, sel.anchorFromId, sel.anchorToId);
+                                nr = clampRecordWithinCanvas(nr);
                                 if (sel.entityId != null && model != null) {
                                     model.updateEntity(entityFromShape(nr));
                                 } else {
@@ -2239,6 +2286,7 @@ public class DrawingCanvas extends JComponent {
                                 Shape rect = new Rectangle2D.Double(Math.min(nx1, nx2), Math.min(ny1, ny2), Math.abs(nx2 - nx1), Math.abs(ny2 - ny1));
                                 ShapeRecord nr = new ShapeRecord(Tool.TEXT, rect, sel.color, sel.stroke, nx1, ny1, nx2, ny2, sel.text, sel.font,
                                         sel.entityId, sel.localId, sel.anchorFromId, sel.anchorToId);
+                                nr = clampRecordWithinCanvas(nr);
                                 if (sel.entityId != null && model != null) {
                                     model.updateEntity(entityFromShape(nr));
                                 } else {
@@ -2250,6 +2298,7 @@ public class DrawingCanvas extends JComponent {
                                 ShapeRecord nr = new ShapeRecord(sel.tool, moved, sel.color, sel.stroke,
                                         sel.x1 + dx, sel.y1 + dy, sel.x2 + dx, sel.y2 + dy, sel.text, sel.font,
                                         sel.entityId, sel.localId, sel.anchorFromId, sel.anchorToId);
+                                nr = clampRecordWithinCanvas(nr);
                                 if (sel.entityId != null && model != null) {
                                     model.updateEntity(entityFromShape(nr));
                                 } else {
@@ -2301,6 +2350,7 @@ public class DrawingCanvas extends JComponent {
                                         new Rectangle2D.Double(Math.min(x1, x2), Math.min(y1, y2), Math.abs(x2 - x1), Math.abs(y2 - y1)),
                                         sel.color, sel.stroke, x1, y1, x2, y2, sel.text, sel.font,
                                         sel.entityId, sel.localId, sel.anchorFromId, sel.anchorToId);
+                                nr = clampRecordWithinCanvas(nr);
                                 if (sel.entityId != null && model != null) {
                                     model.updateEntity(entityFromShape(nr));
                                 } else {
@@ -2312,6 +2362,7 @@ public class DrawingCanvas extends JComponent {
                             } else {
                                 ShapeRecord nr = createRecordFromTool(sel.tool, sel.color, sel.stroke, (int)x1, (int)y1, (int)x2, (int)y2);
                                 if (nr != null) {
+                                    nr = clampRecordWithinCanvas(nr);
                                     String keptText = sel.text != null ? sel.text : nr.text;
                                     Font keptFont = normalizeTextFont(sel.font != null ? sel.font : nr.font);
                                     if (sel.entityId != null && model != null) {
@@ -2384,6 +2435,9 @@ public class DrawingCanvas extends JComponent {
                         }
                         addUndoableEdit(currentMoveEdit);
                         currentMoveEdit = null;
+                    }
+                    if (selectedIndex >= 0 && selectedIndex < shapes.size()) {
+                        ensureShapeVisible(shapes.get(selectedIndex));
                     }
                     redrawBuffer();
                     repaint();
@@ -2478,6 +2532,9 @@ public class DrawingCanvas extends JComponent {
         addComponentListener(new ComponentAdapter() {
             public void componentResized(ComponentEvent e) {
                 ensureBuffer();
+                if (selectedIndex >= 0 && selectedIndex < shapes.size()) {
+                    ensureShapeVisible(shapes.get(selectedIndex));
+                }
                 repaint();
             }
         });
@@ -2493,8 +2550,10 @@ public class DrawingCanvas extends JComponent {
         // Route to appropriate editing method
         if (tool == Tool.TEXT) {
             startEditingText(index);
-        } else if (tool == Tool.RECTANGLE || tool == Tool.OVAL || 
-                   tool == Tool.ROUNDED_RECTANGLE || tool == Tool.STATE ||
+        } else if (tool == Tool.ACTION) {
+            startEditingProcessActionLabel(index);
+        } else if (tool == Tool.OBJECT || tool == Tool.TASK ||
+                   tool == Tool.PROCESS || tool == Tool.STATE ||
                    tool == Tool.ACTOR || tool == Tool.SYSTEM ||
                    tool == Tool.BOUNDARY) {
             startEditingShapeLabel(index);
@@ -2515,8 +2574,8 @@ public class DrawingCanvas extends JComponent {
         if (index < 0 || index >= shapes.size()) return;
         ShapeRecord sel = shapes.get(index);
         // Only editable shapes
-        if (sel.tool != Tool.RECTANGLE && sel.tool != Tool.OVAL && 
-            sel.tool != Tool.ROUNDED_RECTANGLE && sel.tool != Tool.STATE &&
+        if (sel.tool != Tool.OBJECT && sel.tool != Tool.TASK &&
+            sel.tool != Tool.PROCESS && sel.tool != Tool.STATE &&
             sel.tool != Tool.ACTOR && sel.tool != Tool.SYSTEM &&
             sel.tool != Tool.BOUNDARY) {
             return;
@@ -2547,14 +2606,14 @@ public class DrawingCanvas extends JComponent {
                     BorderFactory.createEmptyBorder(3, 10, 3, 10) // padding
                 ));
                 break;
-            case OVAL:
+            case TASK:
                 // Elliptical/oval border
                 tf.setBorder(BorderFactory.createCompoundBorder(
                     new EllipseBorder(),
                     BorderFactory.createEmptyBorder(4, 8, 4, 8)
                 ));
                 break;
-            case ROUNDED_RECTANGLE:
+            case PROCESS:
                 // Rounded rectangle border
                 tf.setBorder(BorderFactory.createCompoundBorder(
                     new RoundedBorder(15),
@@ -2568,7 +2627,7 @@ public class DrawingCanvas extends JComponent {
                     BorderFactory.createEmptyBorder(2, 6, 2, 6)
                 ));
                 break;
-            case RECTANGLE:
+            case OBJECT:
             default:
                 // Standard rectangular border
                 tf.setBorder(BorderFactory.createCompoundBorder(
@@ -2678,6 +2737,19 @@ public class DrawingCanvas extends JComponent {
         DrawingCanvas.this.repaint();
     }
 
+    private void startEditingProcessActionLabel(int index) {
+        if (index < 0 || index >= shapes.size()) return;
+        ShapeRecord sel = shapes.get(index);
+        if (sel.tool != Tool.ACTION) return;
+        beginLabelEdit(index);
+        String newText = showProcessActionEditorDialog(sel);
+        endLabelEdit();
+        if (newText == null) return;
+        updateShapeLabel(newText, index);
+        DrawingCanvas.this.revalidate();
+        DrawingCanvas.this.repaint();
+    }
+
     private void startEditingObjectTypeLabel(int index) {
         if (index < 0 || index >= shapes.size()) return;
         ShapeRecord sel = shapes.get(index);
@@ -2694,154 +2766,6 @@ public class DrawingCanvas extends JComponent {
         DrawingCanvas.this.repaint();
     }
 
-    // private void startEditingImpactLabel(int index) {
-    //     if (index < 0 || index >= shapes.size()) return;
-    //     ShapeRecord sel = shapes.get(index);
-    //     beginLabelEdit(index);
-
-    //     String currentText = sel.text != null ? sel.text : getDefaultLabelForTool(sel.tool);
-    //     if (isTransitionTool(sel.tool)) {
-    //         currentText = formatTransitionLabel(currentText);
-    //     }
-    //     Font font = zoomAwareEditorFont(sel.font);
-
-    //     final JTextField tf = new JTextField(currentText);
-    //     tf.setOpaque(false);
-    //     tf.setBackground(new Color(0, 0, 0, 0));
-    //     tf.setForeground(sel.color != null ? sel.color : drawColor);
-    //     tf.setFont(font);
-    //     tf.setHorizontalAlignment(JTextField.CENTER);
-    //     styleInlineEditor(tf);
-
-    //     FontMetrics fm = getFontMetrics(font);
-    //     int textWidth = fm.stringWidth(currentText);
-    //     int textHeight = fm.getHeight();
-    //     int editorWidth = Math.max(60, textWidth + 20);
-    //     int editorHeight = Math.max(20, textHeight + 6);
-    //     int midX = (int) Math.round((sel.x1 + sel.x2) / 2.0);
-    //     int midY = (int) Math.round((sel.y1 + sel.y2) / 2.0);
-
-    //     tf.setBounds(zoomedBounds(midX - editorWidth / 2.0, midY - editorHeight - 8, editorWidth, editorHeight));
-
-    //     this.add(tf);
-    //     this.revalidate();
-    //     this.repaint();
-    //     tf.requestFocusInWindow();
-    //     tf.selectAll();
-
-    //     final boolean[] finished = {false};
-    //     Runnable finish = () -> {
-    //         if (finished[0]) return;
-    //         finished[0] = true;
-    //         String newText = tf.getText().trim();
-    //         if (newText.isEmpty()) newText = getDefaultLabelForTool(sel.tool);
-    //         DrawingCanvas.this.remove(tf);
-    //         endLabelEdit();
-    //         updateShapeLabel(newText, index);
-    //         DrawingCanvas.this.revalidate();
-    //         DrawingCanvas.this.repaint();
-    //     };
-
-    //     Runnable cancel = () -> {
-    //         finished[0] = true;
-    //         DrawingCanvas.this.remove(tf);
-    //         endLabelEdit();
-    //         DrawingCanvas.this.revalidate();
-    //         DrawingCanvas.this.repaint();
-    //     };
-
-    //     tf.getInputMap(JComponent.WHEN_FOCUSED).put(
-    //         KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0), "commit");
-    //     tf.getActionMap().put("commit", new AbstractAction() {
-    //         @Override public void actionPerformed(ActionEvent e) { finish.run(); }
-    //     });
-
-    //     tf.getInputMap(JComponent.WHEN_FOCUSED).put(
-    //         KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), "cancel");
-    //     tf.getActionMap().put("cancel", new AbstractAction() {
-    //         @Override public void actionPerformed(ActionEvent e) { cancel.run(); }
-    //     });
-
-    //     tf.addFocusListener(new FocusAdapter() {
-    //         @Override public void focusLost(FocusEvent e) {
-    //             finish.run();
-    //         }
-    //     });
-    // }
-
-    // private void startEditingReferenceLabel(int index) {
-    //     if (index < 0 || index >= shapes.size()) return;
-    //     ShapeRecord sel = shapes.get(index);
-    //     if (sel.tool != Tool.REFERENCE) return;
-    //     beginLabelEdit(index);
-
-    //     String currentText = sel.text != null ? sel.text : getDefaultLabelForTool(sel.tool);
-    //     Font font = zoomAwareEditorFont(sel.font);
-
-    //     final JTextArea ta = new JTextArea(currentText);
-    //     ta.setLineWrap(true);
-    //     ta.setWrapStyleWord(true);
-    //     ta.setOpaque(false);
-    //     ta.setBackground(new Color(0, 0, 0, 0));
-    //     ta.setForeground(sel.color != null ? sel.color : drawColor);
-    //     ta.setFont(font);
-    //     styleInlineEditor(ta);
-
-    //     FontMetrics fm = getFontMetrics(font);
-    //     int textWidth = fm.stringWidth(currentText);
-    //     int textHeight = fm.getHeight();
-    //     int editorWidth = Math.max(80, textWidth + 20);
-    //     int editorHeight = Math.max(36, textHeight * 2 + 8);
-    //     int midX = (int) Math.round((sel.x1 + sel.x2) / 2.0);
-    //     int midY = (int) Math.round((sel.y1 + sel.y2) / 2.0);
-
-    //     ta.setBounds(zoomedBounds(midX - editorWidth / 2.0, midY - editorHeight - 8, editorWidth, editorHeight));
-
-    //     this.add(ta);
-    //     this.revalidate();
-    //     this.repaint();
-    //     ta.requestFocusInWindow();
-    //     ta.selectAll();
-
-    //     final boolean[] finished = {false};
-    //     Runnable finish = () -> {
-    //         if (finished[0]) return;
-    //         finished[0] = true;
-    //         String newText = ta.getText().trim();
-    //         if (newText.isEmpty()) newText = getDefaultLabelForTool(sel.tool);
-    //         DrawingCanvas.this.remove(ta);
-    //         endLabelEdit();
-    //         updateShapeLabel(newText, index);
-    //         DrawingCanvas.this.revalidate();
-    //         DrawingCanvas.this.repaint();
-    //     };
-
-    //     Runnable cancel = () -> {
-    //         finished[0] = true;
-    //         DrawingCanvas.this.remove(ta);
-    //         endLabelEdit();
-    //         DrawingCanvas.this.revalidate();
-    //         DrawingCanvas.this.repaint();
-    //     };
-
-    //     ta.getInputMap(JComponent.WHEN_FOCUSED).put(
-    //         KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, InputEvent.CTRL_DOWN_MASK), "commit");
-    //     ta.getActionMap().put("commit", new AbstractAction() {
-    //         @Override public void actionPerformed(ActionEvent e) { finish.run(); }
-    //     });
-
-    //     ta.getInputMap(JComponent.WHEN_FOCUSED).put(
-    //         KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), "cancel");
-    //     ta.getActionMap().put("cancel", new AbstractAction() {
-    //         @Override public void actionPerformed(ActionEvent e) { cancel.run(); }
-    //     });
-
-    //     ta.addFocusListener(new FocusAdapter() {
-    //         @Override public void focusLost(FocusEvent e) {
-    //             finish.run();
-    //         }
-    //     });
-    // }
 
     /**
      * Custom border that draws a rounded rectangle outline matching STATE shapes.
@@ -2858,8 +2782,6 @@ public class DrawingCanvas extends JComponent {
             Graphics2D g2 = (Graphics2D) g.create();
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
             g2.setColor(new Color(0, 0, 0)); 
-            // g2.setStroke(new BasicStroke(2));
-            // g2.drawRoundRect(x, y, width + 1, height, radius, radius);
             g2.dispose();
         }
         
@@ -2875,7 +2797,7 @@ public class DrawingCanvas extends JComponent {
     }
 
     /**
-     * Custom border that draws an elliptical outline matching OVAL/Task shapes.
+     * Custom border that draws an elliptical outline matching TASK/Task shapes.
      */
     class EllipseBorder implements javax.swing.border.Border {
         
@@ -2884,8 +2806,6 @@ public class DrawingCanvas extends JComponent {
             Graphics2D g2 = (Graphics2D) g.create();
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
             g2.setColor(new Color(100, 150, 255)); // Blue outline
-            // g2.setStroke(new BasicStroke(2));
-            // g2.drawOval(x, y, width - 1, height - 1);
             g2.dispose();
         }
         
@@ -2905,12 +2825,13 @@ public class DrawingCanvas extends JComponent {
      */
     private String getDefaultLabelForTool(Tool tool) {
         switch (tool) {
-            case RECTANGLE: return "Object";
+            case OBJECT: return "Object";
             case OBJECT_TYPE: return "Object\nattribute";
             case ACTOR: return "Actor";
             case SYSTEM: return "System";
-            case OVAL: return "Task";
-            case ROUNDED_RECTANGLE: return "Process";
+            case TASK: return "Task";
+            case PROCESS: return "Process";
+            case ACTION: return processActionKind != null ? processActionKind.displayLabel() : ProcessActionKind.INPUT.displayLabel();
             case STATE: return "State";
             case LINE: return "Association";
             case AUTHORISATION: return "Authorisation";
@@ -2963,6 +2884,33 @@ public class DrawingCanvas extends JComponent {
         }
     }
 
+    public enum ProcessActionKind {
+        INPUT("InputAction", "Input"),
+        OUTPUT("OutputAction", "Output"),
+        FETCH("FetchAction", "Fetch"),
+        STORE("StoreAction", "Store"),
+        CREATE("CreateAction", "Create"),
+        UPDATE("UpdateAction", "Update"),
+        DELETE("DeleteAction", "Delete");
+
+        private final String displayLabel;
+        private final String dslKind;
+
+        ProcessActionKind(String displayLabel, String dslKind) {
+            this.displayLabel = displayLabel;
+            this.dslKind = dslKind;
+        }
+
+        public String displayLabel() {
+            return dslKind;
+        }
+
+        @Override
+        public String toString() {
+            return displayLabel;
+        }
+    }
+
     private static class DataflowEditParts {
         final DataflowKind kind;
         final String name;
@@ -2974,6 +2922,16 @@ public class DrawingCanvas extends JComponent {
             this.name = name;
             this.subtypes = subtypes;
             this.annotation = annotation;
+        }
+    }
+
+    private static class ProcessActionEditParts {
+        final String actionWord;
+        final String description;
+
+        ProcessActionEditParts(String actionWord, String description) {
+            this.actionWord = actionWord;
+            this.description = description;
         }
     }
 
@@ -3038,6 +2996,108 @@ public class DrawingCanvas extends JComponent {
             default:
                 return safeName;
         }
+    }
+
+    private ProcessActionEditParts parseProcessActionParts(String text) {
+        String raw = text != null ? text.trim() : "";
+        if (raw.isBlank()) {
+            String fallback = processActionKind != null ? processActionKind.displayLabel() : ProcessActionKind.INPUT.displayLabel();
+            return new ProcessActionEditParts(fallback, "");
+        }
+
+        for (ProcessActionKind kind : ProcessActionKind.values()) {
+            String label = kind.displayLabel();
+            if (raw.equalsIgnoreCase(label)) {
+                return new ProcessActionEditParts(label, "");
+            }
+            if (raw.regionMatches(true, 0, label + "", 0, label.length() + 1)) {
+                String description = raw.substring(label.length() + 1).trim();
+                return new ProcessActionEditParts(label, description);
+            }
+        }
+
+        int colon = raw.indexOf(':');
+        if (colon > 0) {
+            String left = raw.substring(0, colon).trim();
+            String right = raw.substring(colon + 1).trim();
+            if (!left.isBlank()) return new ProcessActionEditParts(left, right);
+        }
+
+        return new ProcessActionEditParts(raw, "");
+    }
+
+    private String buildProcessActionLabel(String actionWord, String description) {
+        String safeActionWord = actionWord != null && !actionWord.isBlank()
+            ? actionWord.trim()
+            : (processActionKind != null ? processActionKind.displayLabel() : ProcessActionKind.INPUT.displayLabel());
+        String safeDescription = description != null ? description.trim() : "";
+        if (safeDescription.isEmpty()) {
+            return safeActionWord;
+        }
+        return safeActionWord + " " + safeDescription;
+    }
+
+    private String showProcessActionEditorDialog(ShapeRecord sel) {
+        Window owner = SwingUtilities.getWindowAncestor(this);
+        final JDialog dialog = owner != null
+            ? new JDialog(owner, "Edit Action", Dialog.ModalityType.APPLICATION_MODAL)
+            : new JDialog((java.awt.Frame) null, "Edit Action", Dialog.ModalityType.APPLICATION_MODAL);
+        dialog.setDefaultCloseOperation(JDialog.DISPOSE_ON_CLOSE);
+
+        ProcessActionEditParts initial = parseProcessActionParts(sel.text != null ? sel.text : getDefaultLabelForTool(sel.tool));
+
+        JPanel root = new JPanel(new BorderLayout(0, 10));
+        root.setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
+        JPanel form = new JPanel();
+        form.setLayout(new BoxLayout(form, BoxLayout.Y_AXIS));
+
+        JPanel kindRow = new JPanel(new BorderLayout(8, 0));
+        kindRow.add(new JLabel("Action:"), BorderLayout.WEST);
+        JComboBox<String> kindSelector = new JComboBox<>();
+        for (ProcessActionKind kind : ProcessActionKind.values()) {
+            kindSelector.addItem(kind.displayLabel());
+        }
+        kindSelector.setSelectedItem(initial.actionWord);
+        kindRow.add(kindSelector, BorderLayout.CENTER);
+        form.add(kindRow);
+        form.add(Box.createVerticalStrut(10));
+
+        JPanel descriptionRow = new JPanel(new BorderLayout(8, 0));
+        descriptionRow.add(new JLabel("Description:"), BorderLayout.WEST);
+        JTextField descriptionField = new JTextField(initial.description, 28);
+        descriptionField.setEditable(true);
+        descriptionRow.add(descriptionField, BorderLayout.CENTER);
+        form.add(descriptionRow);
+
+        JPanel buttonRow = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.RIGHT, 8, 0));
+        JButton cancelBtn = new JButton("Cancel");
+        JButton okBtn = new JButton("OK");
+        buttonRow.add(cancelBtn);
+        buttonRow.add(okBtn);
+
+        root.add(form, BorderLayout.CENTER);
+        root.add(buttonRow, BorderLayout.SOUTH);
+        dialog.setContentPane(root);
+
+        final boolean[] committed = { false };
+        final String[] result = { null };
+        okBtn.addActionListener(e -> {
+            committed[0] = true;
+            Object selected = kindSelector.getEditor().getItem();
+            String actionWord = selected != null ? selected.toString() : "";
+            result[0] = buildProcessActionLabel(actionWord, descriptionField.getText());
+            dialog.dispose();
+        });
+        cancelBtn.addActionListener(e -> dialog.dispose());
+
+        dialog.getRootPane().setDefaultButton(okBtn);
+        dialog.pack();
+        dialog.setLocationRelativeTo(this);
+        descriptionField.selectAll();
+        dialog.setVisible(true);
+
+        if (!committed[0]) return null;
+        return result[0];
     }
 
     private String showDataflowEditorDialog(ShapeRecord sel) {
@@ -3132,6 +3192,52 @@ public class DrawingCanvas extends JComponent {
 
         if (!committed[0]) return null;
         return result[0];
+    }
+
+    /**
+     * Validate completeness rules for implicit model boundaries.
+     * Returns a list of warning messages (empty when no issues).
+     */
+    public java.util.List<String> validateCompleteness(com.example.swingapp.persistence.ReMoDeLExporter.ModelKind modelKind) {
+        java.util.List<String> warnings = new java.util.ArrayList<>();
+        int countTask = 0;
+        int countState = 0;
+        int countTransition = 0;
+        int countObject = 0;
+        int countObjectType = 0;
+
+        for (ShapeRecord r : shapes) {
+            if (r == null) continue;
+            switch (r.tool) {
+                case TASK: countTask++; break;
+                case STATE: countState++; break;
+                case ARROW_OPEN:
+                case INITIAL_TRANSITION:
+                case FINAL_TRANSITION:
+                    countTransition++; break;
+                case OBJECT: countObject++; break;
+                case OBJECT_TYPE: countObjectType++; break;
+                default: break;
+            }
+        }
+
+        switch (modelKind) {
+            case IMPACT_MODEL:
+                if (countTask == 0) warnings.add("Impact model appears to contain no Task shapes — completeness rule: include atomic tasks inside the diagram.");
+                break;
+            case STATE_MODEL:
+                if (countState == 0) warnings.add("State model appears to contain no State shapes — a top-level state machine requires at least one state.");
+                if (countTransition == 0) warnings.add("State model contains no transitions — consider adding transition shapes (open/initial/final).");
+                break;
+            case OBJECT_MODEL:
+                if (countObject == 0 && countObjectType == 0) warnings.add("Object model appears to contain no objects — add Object or Object Type shapes to satisfy completeness.");
+                break;
+            default:
+                // no implicit-boundary checks for other models
+                break;
+        }
+
+        return warnings;
     }
 
     private TransitionLabelParts parseTransitionLabel(String text) {
@@ -3504,6 +3610,44 @@ public class DrawingCanvas extends JComponent {
             sel.text, sel.font, sel.entityId, sel.localId, fromAnchor, toAnchor);
     }
 
+    private ShapeRecord clampRecordWithinCanvas(ShapeRecord record) {
+        if (record == null || isConnectorTool(record.tool)) return record;
+
+        Rectangle2D bounds = record.shape != null ? record.shape.getBounds2D() : null;
+        if (bounds == null) return record;
+
+        double dx = 0.0;
+        double dy = 0.0;
+        if (bounds.getX() < CANVAS_EDGE_PADDING) dx = CANVAS_EDGE_PADDING - bounds.getX();
+        if (bounds.getY() < CANVAS_EDGE_PADDING) dy = CANVAS_EDGE_PADDING - bounds.getY();
+        if (Math.abs(dx) < 1e-9 && Math.abs(dy) < 1e-9) return record;
+
+        Shape movedShape = AffineTransform.getTranslateInstance(dx, dy).createTransformedShape(record.shape);
+        return new ShapeRecord(
+            record.tool,
+            movedShape,
+            record.color,
+            record.stroke,
+            record.x1 + dx,
+            record.y1 + dy,
+            record.x2 + dx,
+            record.y2 + dy,
+            record.text,
+            record.font,
+            record.entityId,
+            record.localId,
+            record.anchorFromId,
+            record.anchorToId
+        );
+    }
+
+    private void ensureShapeVisible(ShapeRecord record) {
+        if (record == null) return;
+        Rectangle visible = zoomedBounds(record.x1, record.y1, Math.max(40.0, Math.abs(record.x2 - record.x1)), Math.max(40.0, Math.abs(record.y2 - record.y1)));
+        visible.grow(40, 40);
+        scrollRectToVisible(visible);
+    }
+
     private void persistConnectorRecord(int index, ShapeRecord nr) {
         if (nr == null) return;
 
@@ -3704,11 +3848,11 @@ public class DrawingCanvas extends JComponent {
                 s = new RoundRectangle2D.Double(rx, ry, rw, rh, rh, rh);
                 text = "State";
                 break;
-            case OVAL:
+            case TASK:
                 s = new Ellipse2D.Double(rx, ry, rw, rh);
                 text = "Task";
                 break;
-            case RECTANGLE:
+            case OBJECT:
                 s = new Rectangle2D.Double(rx, ry, rw, rh);
                 text = "Object";
                 break;
@@ -3727,9 +3871,13 @@ public class DrawingCanvas extends JComponent {
                 s = new Rectangle2D.Double(rx, ry, rw, rh);
                 text = "System";
                 break;
-            case ROUNDED_RECTANGLE:
+            case PROCESS:
                 s = new RoundRectangle2D.Double(rx, ry, rw, rh, Math.max(8, Math.min(rw, rh) / 4.0), Math.max(8, Math.min(rw, rh) / 4.0));
                 text = "Process";
+                break;
+            case ACTION:
+                s = new RoundRectangle2D.Double(rx, ry, rw, rh, Math.max(8, Math.min(rw, rh) / 4.0), Math.max(8, Math.min(rw, rh) / 4.0));
+                text = getDefaultLabelForTool(t);
                 break;
             case BOUNDARY:
                 s = buildBoundaryShape(rx, ry, rw, rh);
@@ -3832,11 +3980,11 @@ public class DrawingCanvas extends JComponent {
                 s = new RoundRectangle2D.Double(rx, ry, rw, rh, rh, rh);
                 text = "State";
                 break;
-            case OVAL:
+            case TASK:
                 s = new Ellipse2D.Double(rx, ry, rw, rh);
                 text = "Task";
                 break;
-            case RECTANGLE:
+            case OBJECT:
                 s = new Rectangle2D.Double(rx, ry, rw, rh);
                 text = "Object";
                 break;
@@ -3855,7 +4003,7 @@ public class DrawingCanvas extends JComponent {
                 s = new Rectangle2D.Double(rx, ry, rw, rh);
                 text = "System";
                 break;
-            case ROUNDED_RECTANGLE:
+            case ACTION:
                 s = new RoundRectangle2D.Double(rx, ry, rw, rh, Math.max(8, Math.min(rw, rh) / 4.0), Math.max(8, Math.min(rw, rh) / 4.0));
                 text = "Process";
                 break;
@@ -4098,9 +4246,10 @@ public class DrawingCanvas extends JComponent {
                 }
                 break;
             }
-            case OVAL:
-            case RECTANGLE:
-            case ROUNDED_RECTANGLE: {
+            case TASK:
+            case OBJECT:
+            case PROCESS:
+            case ACTION: {
                 // Draw the shape border
                 g.draw(r.shape);
                 // Draw text label if present
@@ -4830,15 +4979,14 @@ public class DrawingCanvas extends JComponent {
     }
 
     public void clear() {
-        shapes.clear();
-        if (buf != null) {
-            Graphics2D g = buf.createGraphics();
-            g.setColor(Color.WHITE);
-            g.fillRect(0, 0, buf.getWidth(), buf.getHeight());
-            g.dispose();
-        }
+        setModel(null);
+        undoManager.discardAllEdits();
+        currentMoveEdit = null;
+        preview = null;
         selectedIndex = -1;
         selectAllActive = false;
+        updateUndoRedoState();
+        updateCanvasExtent();
         repaint();
     }
 
@@ -4924,7 +5072,7 @@ public class DrawingCanvas extends JComponent {
 
     public void saveDrawing(File file) throws IOException {
         if (file == null) throw new IllegalArgumentException("File cannot be null");
-        CanvasSnapshot snapshot = new CanvasSnapshot(new ArrayList<>(shapes));
+        CanvasSnapshot snapshot = new CanvasSnapshot(new ArrayList<>(shapes), zoomScale, documentModelTypeName);
         try (ObjectOutputStream out = new ObjectOutputStream(new FileOutputStream(file))) {
             out.writeObject(snapshot);
             System.out.println("Drawing saved successfully.");
@@ -4938,13 +5086,21 @@ public class DrawingCanvas extends JComponent {
             snapshot = (CanvasSnapshot) in.readObject();
         }
         setModel(null);
-        shapes.clear();
-        idToIndex.clear();
         undoManager.discardAllEdits();
         selectedIndex = -1;
         preview = null;
+        currentMoveEdit = null;
+        loadedDocumentModelTypeName = snapshot != null ? snapshot.modelTypeName : null;
+        if (loadedDocumentModelTypeName != null && !loadedDocumentModelTypeName.isBlank()) {
+            documentModelTypeName = loadedDocumentModelTypeName;
+        }
         if (snapshot != null && snapshot.shapes != null) {
             shapes.addAll(snapshot.shapes);
+        }
+        if (snapshot != null && snapshot.zoomScale > 0.0) {
+            setZoom(snapshot.zoomScale);
+        } else {
+            setZoom(1.0);
         }
         redrawBuffer();
         repaint();

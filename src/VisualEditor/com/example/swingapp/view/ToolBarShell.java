@@ -59,6 +59,7 @@ public class ToolBarShell {
     private JComboBox<ReferenceKind> referenceSelector;
     private JComboBox<ImpactKind> impactSelector;
     private JComboBox<DataflowKind> dataflowSelector;
+    private JComboBox<DrawingCanvas.ProcessActionKind> processActionSelector;
     private JSpinner objectTypeCountSpinner;
     private JLabel zoomValueLabel;
     private File currentDrawingFile;
@@ -88,7 +89,7 @@ public class ToolBarShell {
         SELECT,
         PAN,
         RECT,
-        OVAL,
+        TASK,
         ROUND_RECT,
         STATE,
         LINE,
@@ -212,7 +213,8 @@ public class ToolBarShell {
         toolBar.add(modelSelector);
 
         // Clear button
-        JButton clearBtn = new JButton("Clear");
+        JButton clearBtn = new JButton("Clear Canvas");
+        clearBtn.setToolTipText("Remove all shapes from the canvas");
         clearBtn.addActionListener(e -> canvas.clear());
         toolBar.add(clearBtn);
 
@@ -224,12 +226,13 @@ public class ToolBarShell {
         selectBtn.setSelected(true);
         toolBar.add(selectBtn);
 
+        // TODO: Finish implementing the pan tool
         // Pan tool (drag-move entity and its attached connectors)
-        JToggleButton panBtn = new JToggleButton("Pan", new ToolIcon(IconKind.PAN));
-        panBtn.addActionListener(e -> canvas.setCurrentTool(DrawingCanvas.Tool.PAN));
-        toolGroup.add(panBtn);
-        toolButtons.put(DrawingCanvas.Tool.PAN, panBtn);
-        toolBar.add(panBtn);
+        // JToggleButton panBtn = new JToggleButton("Pan", new ToolIcon(IconKind.PAN));
+        // panBtn.addActionListener(e -> canvas.setCurrentTool(DrawingCanvas.Tool.PAN));
+        // toolGroup.add(panBtn);
+        // toolButtons.put(DrawingCanvas.Tool.PAN, panBtn);
+        // toolBar.add(panBtn);
 
         toolBar.addSeparator();
         toolBar.add(new JLabel("Zoom:"));
@@ -355,6 +358,21 @@ public class ToolBarShell {
                     }
                 }
                 try {
+                    // Validate completeness rules for the chosen model kind and warn the user
+                    java.util.List<String> warnings = canvas.validateCompleteness(currentModelKind());
+                    if (!warnings.isEmpty()) {
+                        StringBuilder sb = new StringBuilder();
+                        sb.append("The diagram may violate completeness rules:\n\n");
+                        for (String w : warnings) {
+                            sb.append("- ").append(w).append("\n");
+                        }
+                        sb.append("\nDo you want to continue with export?");
+                        int choice = JOptionPane.showConfirmDialog(parentFrame, sb.toString(), "Export Warnings", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+                        if (choice != JOptionPane.YES_OPTION) {
+                            return;
+                        }
+                    }
+
                     ReMoDeLModel model = canvas.getExportModel();
                     if (filePath.toLowerCase().endsWith(".json")) {
                         ReMoDeLExporter.exportToJSON(model, filePath);
@@ -466,6 +484,7 @@ public class ToolBarShell {
         }
 
         try {
+            canvas.setDocumentModelTypeName(activeModelType != null ? activeModelType.name() : ModelType.TASK_MODEL.name());
             canvas.saveDrawing(target);
             currentDrawingFile = target;
             JOptionPane.showMessageDialog(parentFrame, "Drawing saved successfully", "Success", JOptionPane.INFORMATION_MESSAGE);
@@ -483,6 +502,7 @@ public class ToolBarShell {
         File file = chooser.getSelectedFile();
         try {
             canvas.loadDrawing(file);
+            applyLoadedModelContext(canvas.getLoadedDocumentModelTypeName());
             currentDrawingFile = file;
             JOptionPane.showMessageDialog(parentFrame, "Drawing loaded successfully", "Success", JOptionPane.INFORMATION_MESSAGE);
         } catch (Exception ex) {
@@ -517,7 +537,29 @@ public class ToolBarShell {
         }
 
         activeModelType = selected;
+        canvas.setDocumentModelTypeName(activeModelType.name());
         rebuildModelTools(selected);
+    }
+
+    private void applyLoadedModelContext(String modelTypeName) {
+        ModelType loadedType = null;
+        if (modelTypeName != null && !modelTypeName.isBlank()) {
+            try {
+                loadedType = ModelType.valueOf(modelTypeName.trim());
+            } catch (IllegalArgumentException ignored) {
+                loadedType = null;
+            }
+        }
+        if (loadedType == null) {
+            loadedType = ModelType.TASK_MODEL;
+        }
+
+        activeModelType = loadedType;
+        canvas.setDocumentModelTypeName(loadedType.name());
+        suppressModelSelectorEvents = true;
+        modelSelector.setSelectedItem(loadedType);
+        suppressModelSelectorEvents = false;
+        rebuildModelTools(loadedType);
     }
 
     private ReMoDeLExporter.ModelKind currentModelKind() {
@@ -543,6 +585,7 @@ public class ToolBarShell {
         toolButtons.keySet().removeIf(t -> t != DrawingCanvas.Tool.SELECT && t != DrawingCanvas.Tool.PAN && t != DrawingCanvas.Tool.TEXT);
         toolButtons.keySet().removeIf(t -> t != DrawingCanvas.Tool.SELECT && t != DrawingCanvas.Tool.PAN);
         toolGroup = new ButtonGroup();
+        canvas.setDocumentModelTypeName(type != null ? type.name() : ModelType.TASK_MODEL.name());
         JToggleButton selectBtn = toolButtons.get(DrawingCanvas.Tool.SELECT);
         JToggleButton panBtn = toolButtons.get(DrawingCanvas.Tool.PAN);
         if (selectBtn != null) toolGroup.add(selectBtn);
@@ -550,7 +593,7 @@ public class ToolBarShell {
 
         switch (type) {
             case TASK_MODEL:
-                addToolButton(bottomBar, DrawingCanvas.Tool.OVAL, "Task", IconKind.OVAL);
+                addToolButton(bottomBar, DrawingCanvas.Tool.TASK, "Task", IconKind.TASK);
                 addToolButton(bottomBar, DrawingCanvas.Tool.ACTOR, "Actor", IconKind.ACTOR);
                 addToolButton(bottomBar, DrawingCanvas.Tool.SYSTEM, "System", IconKind.SYSTEM);
                 addToolButton(bottomBar, DrawingCanvas.Tool.BOUNDARY, "Boundary", IconKind.BOUNDARY);
@@ -560,8 +603,8 @@ public class ToolBarShell {
                 addToolButton(bottomBar, DrawingCanvas.Tool.ARROW_DIAMOND, "Composition", IconKind.ARROW_DIAMOND);
                 break;
             case IMPACT_MODEL:
-                addToolButton(bottomBar, DrawingCanvas.Tool.OVAL, "Task", IconKind.OVAL);
-                addToolButton(bottomBar, DrawingCanvas.Tool.RECTANGLE, "Object", IconKind.RECT);
+                addToolButton(bottomBar, DrawingCanvas.Tool.TASK, "Task", IconKind.TASK);
+                addToolButton(bottomBar, DrawingCanvas.Tool.OBJECT, "Object", IconKind.RECT);
                 addToolButton(bottomBar, DrawingCanvas.Tool.ARROW_EMPTY, "Generalisation", IconKind.ARROW_EMPTY);
                 addToolButton(bottomBar, DrawingCanvas.Tool.IMPACT, "Impact", IconKind.IMPACT);
                 impactSelector = new JComboBox<>(ImpactKind.values());
@@ -570,6 +613,7 @@ public class ToolBarShell {
                 impactSelector.addActionListener(e -> {
                     ImpactKind kind = (ImpactKind) impactSelector.getSelectedItem();
                     canvas.setImpactLabel(kind != null ? kind.label() : ImpactKind.CREATE.label());
+                    canvas.setCurrentTool(DrawingCanvas.Tool.IMPACT);
                 });
                 bottomBar.add(impactSelector);
                 break;
@@ -582,7 +626,17 @@ public class ToolBarShell {
                 addToolButton(bottomBar, DrawingCanvas.Tool.AUTHORISATION, "Authorisation", IconKind.AUTHORISATION);
                 break;
             case PROCESS_MODEL:
-                addToolButton(bottomBar, DrawingCanvas.Tool.ROUNDED_RECTANGLE, "Process", IconKind.ROUND_RECT);
+                addToolButton(bottomBar, DrawingCanvas.Tool.PROCESS, "Process", IconKind.ROUND_RECT);
+                addToolButton(bottomBar, DrawingCanvas.Tool.ACTION, "Action", IconKind.ROUND_RECT);
+                processActionSelector = new JComboBox<>(DrawingCanvas.ProcessActionKind.values());
+                processActionSelector.setSelectedItem(DrawingCanvas.ProcessActionKind.INPUT);
+                canvas.setProcessActionKind(DrawingCanvas.ProcessActionKind.INPUT);
+                processActionSelector.addActionListener(e -> {
+                    DrawingCanvas.ProcessActionKind kind = (DrawingCanvas.ProcessActionKind) processActionSelector.getSelectedItem();
+                    canvas.setProcessActionKind(kind != null ? kind : DrawingCanvas.ProcessActionKind.INPUT);
+                    canvas.setCurrentTool(DrawingCanvas.Tool.ACTION);
+                });
+                bottomBar.add(processActionSelector);
                 addToolButton(bottomBar, DrawingCanvas.Tool.ARROW_FILLED, "Dataflow", IconKind.ARROW_FILLED);
                 dataflowSelector = new JComboBox<>(DataflowKind.values());
                 dataflowSelector.setSelectedItem(DataflowKind.OBJECT);
@@ -590,6 +644,7 @@ public class ToolBarShell {
                 dataflowSelector.addActionListener(e -> {
                     DataflowKind kind = (DataflowKind) dataflowSelector.getSelectedItem();
                     canvas.setDataflowKind(kind != null ? kind.canvasKind() : DataflowKind.OBJECT.canvasKind());
+                    canvas.setCurrentTool(DrawingCanvas.Tool.ARROW_FILLED);
                 });
                 bottomBar.add(dataflowSelector);
                 break;
@@ -603,6 +658,7 @@ public class ToolBarShell {
                     Object value = objectTypeCountSpinner.getValue();
                     if (value instanceof Number) {
                         canvas.setObjectTypeAttributeCount(((Number) value).intValue());
+                        canvas.setCurrentTool(DrawingCanvas.Tool.OBJECT_TYPE);
                     }
                 });
                 bottomBar.add(objectTypeCountSpinner);
@@ -616,6 +672,7 @@ public class ToolBarShell {
                 referenceSelector.addActionListener(e -> {
                     ReferenceKind kind = (ReferenceKind) referenceSelector.getSelectedItem();
                     canvas.setReferenceQualifier(kind != null ? kind.qualifier() : "");
+                    canvas.setCurrentTool(DrawingCanvas.Tool.REFERENCE);
                 });
                 bottomBar.add(referenceSelector);
                 break;
@@ -706,7 +763,7 @@ public class ToolBarShell {
                 case RECT:
                     g2.drawRect(cx, cy, w, h);
                     break;
-                case OVAL:
+                case TASK:
                     g2.drawOval(cx, cy, w, h);
                     break;
                 case ROUND_RECT:
