@@ -7,15 +7,15 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 
+
 /**
- * In-memory manager for ReMoDeL entities.
- * Emits ModelEvent to registered listeners when mutations occur.
+ * Thread-safe in-memory store for entities with listener-based change events.
  */
 public class ReMoDeLModel {
     private final Map<String, ReMoDeLEntity> entities = new ConcurrentHashMap<>();
     private final List<ModelListener> listeners = new CopyOnWriteArrayList<>();
 
-    // batch mode
+
     private final List<ModelEvent> pending = new ArrayList<>();
     private boolean inBatch = false;
 
@@ -61,7 +61,9 @@ public class ReMoDeLModel {
     public void endBatch() {
         inBatch = false;
         if (!pending.isEmpty()) {
-            // collapse to a single BATCH event (listeners can refresh as they need)
+
+            // Collapse buffered events into one refresh-friendly batch event.
+
             List<String> ids = new ArrayList<>();
             for (ModelEvent me : pending) ids.addAll(me.getEntityIds());
             dispatch(new ModelEvent(ModelEvent.Type.BATCH, ids));

@@ -2,8 +2,9 @@ package com.example.swingapp.model;
 
 import java.awt.geom.Path2D;
 
+
 /**
- * Represents a Region (polygon or rectangle) in the model.
+ * Domain entity representing a region backed by a geometric path.
  */
 public class Region extends ReMoDeLEntity {
     public Region() {

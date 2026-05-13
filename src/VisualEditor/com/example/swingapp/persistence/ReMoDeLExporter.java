@@ -11,8 +11,9 @@ import java.util.stream.Collectors;
 import com.example.swingapp.model.ReMoDeLEntity;
 import com.example.swingapp.model.ReMoDeLModel;
 
+
 /**
- * Exports ReMoDeL model to XML format suitable for ReMoDeL Model-Driven Engineering toolkit.
+ * Converts in-memory entities into XML, JSON, and ReMoDeL DSL exports.
  */
 public class ReMoDeLExporter {
 
@@ -34,22 +35,8 @@ public class ReMoDeLExporter {
         }
     }
 
-    private static final Set<String> METAMODEL_NODE_TYPES = Set.of("OBJECT_TYPE", "OBJECT");
-
-    private static class ConceptExport {
-        final String id;
-        final String name;
-        final List<String> bodyLines = new ArrayList<>();
-        final List<String> inheritTypes = new ArrayList<>();
-
-        ConceptExport(String id, String name) {
-            this.id = id;
-            this.name = name;
-        }
-    }
-
     /**
-     * Export model to XML file
+     * Writes all nodes and connectors to an XML document.
      */
     public static void exportToXML(ReMoDeLModel model, String filePath) throws IOException {
         if (model == null) throw new IllegalArgumentException("Model cannot be null");
@@ -59,7 +46,7 @@ public class ReMoDeLExporter {
         xml.append("<remodelDocument>\n");
         xml.append("  <entities>\n");
 
-        // Export all entities (nodes)
+
         for (ReMoDeLEntity entity : model.getAll()) {
             if (!isConnectorEntity(entity)) {
                 xml.append(entityToXML(entity, 4));
@@ -68,7 +55,7 @@ public class ReMoDeLExporter {
         xml.append("  </entities>\n");
         xml.append("  <connectors>\n");
 
-        // Export connectors (arcs)
+
         for (ReMoDeLEntity entity : model.getAll()) {
             if (isConnectorEntity(entity)) {
                 xml.append(connectorToXML(entity, 4));
@@ -77,14 +64,14 @@ public class ReMoDeLExporter {
         xml.append("  </connectors>\n");
         xml.append("</remodelDocument>\n");
 
-        // Write to file
+
         try (FileWriter fw = new FileWriter(filePath)) {
             fw.write(xml.toString());
         }
     }
 
     /**
-     * Export to JSON format
+     * Writes all nodes and connectors to a JSON document.
      */
     public static void exportToJSON(ReMoDeLModel model, String filePath) throws IOException {
         if (model == null) throw new IllegalArgumentException("Model cannot be null");
@@ -124,7 +111,7 @@ public class ReMoDeLExporter {
     }
 
     /**
-     * Export to ReMoDeL model-instance DSL (.mod text).
+     * Writes a typed ReMoDeL DSL model for the requested model kind.
      */
     public static void exportToRemodelModel(ReMoDeLModel model, String filePath, ModelKind modelKind) throws IOException {
         if (model == null) throw new IllegalArgumentException("Model cannot be null");
@@ -156,9 +143,11 @@ public class ReMoDeLExporter {
                 out = buildImpactModelDsl(modelName, diagramName, nodes, connectors, filePath);
                 break;
             case PROCESS_MODEL:
+                out = buildProcessModelDsl(modelName, diagramName, nodes, connectors, filePath);
+                break;
             case TASK_MODEL:
             default:
-                out = buildStandardDiagramDsl(kind, modelName, diagramName, nodes, connectors, filePath);
+                out = buildTaskModelDsl(kind, modelName, diagramName, nodes, connectors, filePath);
                 break;
         }
 
@@ -168,13 +157,13 @@ public class ReMoDeLExporter {
     }
 
     /**
-     * Legacy entry point retained for existing callers.
+     * Backward-compatible task-model export entry point.
      */
     public static void exportToRemodel(ReMoDeLModel model, String filePath) throws IOException {
         exportToRemodelModel(model, filePath, ModelKind.TASK_MODEL);
     }
 
-    private static String buildStandardDiagramDsl(
+    private static String buildTaskModelDsl(
             ModelKind kind,
             String modelName,
             String diagramName,
@@ -192,17 +181,17 @@ public class ReMoDeLExporter {
         out.append("   d1 : Diagram(name = \"").append(escapeDsl(diagramName)).append("\"");
 
         for (ModCollection collection : collections) {
-            out.append(",\n");
-            out.append("      ").append(collection.propertyName).append(" = ")
+            out.append(",");
+            out.append(" ").append(collection.propertyName).append(" = ")
                .append(collection.elementType).append("[");
             if (!collection.entries.isEmpty()) {
                 out.append("\n");
                 for (int i = 0; i < collection.entries.size(); i++) {
-                    out.append("         ").append(collection.entries.get(i));
+                    out.append("      ").append(collection.entries.get(i));
                     if (i < collection.entries.size() - 1) out.append(",");
                     out.append("\n");
                 }
-                out.append("      ");
+                out.append("   ");
             }
             out.append("]");
         }
@@ -238,17 +227,17 @@ public class ReMoDeLExporter {
         out.append("   d1 : Diagram(name = \"").append(escapeDsl(diagramName)).append("\"");
 
         for (ModCollection collection : collections) {
-            out.append(",\n");
-            out.append("      ").append(collection.propertyName).append(" = ")
+            out.append(",");
+            out.append(" ").append(collection.propertyName).append(" = ")
                .append(collection.elementType).append("[");
             if (!collection.entries.isEmpty()) {
                 out.append("\n");
                 for (int i = 0; i < collection.entries.size(); i++) {
-                    out.append("         ").append(collection.entries.get(i));
+                    out.append("      ").append(collection.entries.get(i));
                     if (i < collection.entries.size() - 1) out.append(",");
                     out.append("\n");
                 }
-                out.append("      ");
+                out.append("   ");
             }
             out.append("]");
         }
@@ -256,6 +245,249 @@ public class ReMoDeLExporter {
         out.append(")\n");
         out.append("}\n");
         return out.toString();
+    }
+
+    private static String buildProcessModelDsl(
+            String modelName,
+            String diagramName,
+            List<ReMoDeLEntity> nodes,
+            List<ReMoDeLEntity> connectors,
+            String filePath) {
+
+        Map<String, Integer> prefixCounters = new java.util.LinkedHashMap<>();
+        java.util.List<ReMoDeLEntity> processNodes = nodes.stream()
+            .filter(n -> "PROCESS".equals(getShapeType(n)))
+            .collect(Collectors.toList());
+        java.util.List<ReMoDeLEntity> actionNodes = nodes.stream()
+            .filter(n -> "ACTION".equals(getShapeType(n)))
+            .collect(Collectors.toList());
+        java.util.List<ReMoDeLEntity> dataflowConnectors = connectors.stream()
+            .filter(c -> "ARROW_FILLED".equals(getShapeType(c)))
+            .collect(Collectors.toList());
+
+        if (processNodes.isEmpty() && !actionNodes.isEmpty()) {
+            processNodes = new ArrayList<>();
+            processNodes.add(synthesizeProcessContainer(actionNodes, diagramName));
+        }
+
+        java.util.Map<String, ReMoDeLEntity> assignedProcessByActionId = new java.util.LinkedHashMap<>();
+        java.util.Map<String, java.util.List<ReMoDeLEntity>> actionsByProcessId = new java.util.LinkedHashMap<>();
+
+        for (ReMoDeLEntity action : actionNodes) {
+            ReMoDeLEntity owner = findContainingProcess(action, processNodes);
+            if (owner == null) continue;
+            assignedProcessByActionId.put(action.getId(), owner);
+            actionsByProcessId.computeIfAbsent(owner.getId(), k -> new ArrayList<>()).add(action);
+        }
+
+        java.util.Map<String, String> processTokenById = new java.util.LinkedHashMap<>();
+        java.util.Map<String, String> actionTokenById = new java.util.LinkedHashMap<>();
+        java.util.Map<String, ActionKind> actionKindById = new java.util.LinkedHashMap<>();
+        java.util.Map<String, String> actionNameById = new java.util.LinkedHashMap<>();
+
+        for (ReMoDeLEntity process : processNodes) {
+            String processToken = nextToken(prefixCounters, "p");
+            processTokenById.put(process.getId(), processToken);
+
+            java.util.List<ReMoDeLEntity> ownedActions = actionsByProcessId.get(process.getId());
+            if (ownedActions == null) continue;
+            ownedActions.sort(ReMoDeLExporter::compareForExport);
+
+            for (ReMoDeLEntity action : ownedActions) {
+                ActionLabelParts parts = parseActionLabel(asText(action.get("text")));
+                String actionToken = nextToken(prefixCounters, actionPrefix(parts.kind));
+                actionTokenById.put(action.getId(), actionToken);
+                actionKindById.put(action.getId(), parts.kind);
+                String rawName = firstLine(asText(action.get("text")));
+                if (rawName == null || rawName.isBlank()) {
+                    rawName = parts.kind.displayLabel() + " " + actionToken.substring(1);
+                }
+                actionNameById.put(action.getId(), rawName.trim());
+            }
+        }
+
+        java.util.List<String> processEntries = new ArrayList<>();
+        int unnamedProcessCount = 0;
+
+        for (ReMoDeLEntity process : processNodes) {
+            String processToken = processTokenById.get(process.getId());
+            if (processToken == null) continue;
+
+            String processName = firstLine(asText(process.get("text")));
+            if (processName == null || processName.isBlank()) {
+                unnamedProcessCount++;
+                processName = "Process " + unnamedProcessCount;
+            }
+
+            java.util.List<ReMoDeLEntity> ownedActions = actionsByProcessId.getOrDefault(process.getId(), java.util.Collections.emptyList());
+            java.util.List<ActionKind> actionKinds = new ArrayList<>();
+            for (ReMoDeLEntity action : ownedActions) {
+                ActionKind kind = actionKindById.get(action.getId());
+                if (kind != null) actionKinds.add(kind);
+            }
+            String processKind = inferProcessKind(actionKinds);
+
+            java.util.List<String> actionEntries = new ArrayList<>();
+            for (ReMoDeLEntity action : ownedActions) {
+                String actionToken = actionTokenById.get(action.getId());
+                ActionKind kind = actionKindById.get(action.getId());
+                if (actionToken == null || kind == null) continue;
+                String actionName = actionNameById.getOrDefault(action.getId(), kind.displayLabel());
+
+                java.util.LinkedHashMap<String, ModValue> fields = new java.util.LinkedHashMap<>();
+                fields.put("name", new ModValue(actionName, false));
+                if (kind == ActionKind.INPUT && looksLikeIdentifierAction(actionName)) {
+                    fields.put("id", new ModValue("true", true));
+                } else if (kind == ActionKind.STORE && "update".equals(processKind)) {
+                    fields.put("again", new ModValue("true", true));
+                } else if (kind == ActionKind.DELETE && looksLikeArchiveAction(processName, actionName)) {
+                    fields.put("archive", new ModValue("true", true));
+                }
+                actionEntries.add(buildEntry(actionToken, kind.displayLabel, fields));
+            }
+
+            java.util.List<String> dataflowEntries = new ArrayList<>();
+            for (ReMoDeLEntity connector : dataflowConnectors) {
+                String sourceId = toStringOrNull(connector.get("fromId"));
+                if (sourceId == null) sourceId = toStringOrNull(connector.get("from"));
+                String targetId = toStringOrNull(connector.get("toId"));
+                if (targetId == null) targetId = toStringOrNull(connector.get("to"));
+                if (sourceId == null || targetId == null) continue;
+
+                ReMoDeLEntity sourceProcess = assignedProcessByActionId.get(sourceId);
+                ReMoDeLEntity targetProcess = assignedProcessByActionId.get(targetId);
+                if (sourceProcess == null || targetProcess == null) continue;
+                if (!process.getId().equals(sourceProcess.getId()) || !process.getId().equals(targetProcess.getId())) continue;
+
+                String sourceToken = actionTokenById.get(sourceId);
+                String targetToken = actionTokenById.get(targetId);
+                ActionKind sourceKind = actionKindById.get(sourceId);
+                ActionKind targetKind = actionKindById.get(targetId);
+                if (sourceToken == null || targetToken == null || sourceKind == null || targetKind == null) continue;
+
+                String label = asText(connector.get("text"));
+                ProcessDatumParts datumParts = parseProcessDatumParts(label);
+                ProcessDatumKind datumKind = inferProcessDatumKind(datumParts, sourceKind, targetKind);
+                String datumName = inferProcessDatumName(datumParts, label, sourceKind, targetKind, actionNameById.get(sourceId), actionNameById.get(targetId));
+                String datumToken = nextToken(prefixCounters, datumPrefix(datumKind));
+
+                java.util.LinkedHashMap<String, ModValue> datumFields = new java.util.LinkedHashMap<>();
+                datumFields.put("name", new ModValue(datumName, false));
+                if (datumParts.subtypes != null && !datumParts.subtypes.isBlank()) {
+                    datumFields.put("kinds", new ModValue(datumParts.subtypes, false));
+                }
+
+                StringBuilder dataflow = new StringBuilder();
+                dataflow.append(nextToken(prefixCounters, "d")).append(" : Dataflow(source = ")
+                        .append(sourceToken).append(", target = ").append(targetToken).append(", datum = \n")
+                        .append("            ").append(buildEntry(datumToken, datumElementType(datumKind), datumFields)).append("\n")
+                        .append("      )");
+                dataflowEntries.add(dataflow.toString());
+            }
+
+            StringBuilder processEntry = new StringBuilder();
+            processEntry.append(processToken).append(" : Process(name = \"").append(escapeDsl(processName)).append("\"");
+            processEntry.append(", kind = \"").append(escapeDsl(processKind)).append("\"");
+
+            if (!actionEntries.isEmpty()) {
+                processEntry.append(", actions = Action[\n");
+                for (int i = 0; i < actionEntries.size(); i++) {
+                    processEntry.append("         ").append(actionEntries.get(i));
+                    if (i < actionEntries.size() - 1) processEntry.append(",");
+                    processEntry.append("\n");
+                }
+                processEntry.append("      ]");
+            }
+            if (!dataflowEntries.isEmpty()) {
+                processEntry.append(", dataflows = Dataflow[\n");
+                for (int i = 0; i < dataflowEntries.size(); i++) {
+                    processEntry.append("         ").append(dataflowEntries.get(i));
+                    if (i < dataflowEntries.size() - 1) processEntry.append(",");
+                    processEntry.append("\n");
+                }
+                processEntry.append("      ]");
+            }
+            processEntry.append(")");
+            processEntries.add(processEntry.toString());
+        }
+
+        StringBuilder out = new StringBuilder();
+        appendCreatedByComment(out, filePath);
+        out.append("model ").append(modelName).append(" : ProcessModel {\n");
+        out.append("   d1 : Diagram(name = \"").append(escapeDsl(diagramName)).append("\"");
+        if (!processEntries.isEmpty()) {
+            out.append(", processes = Process[\n");
+            for (int i = 0; i < processEntries.size(); i++) {
+                out.append("      ").append(processEntries.get(i));
+                if (i < processEntries.size() - 1) out.append(",");
+                out.append("\n");
+            }
+            out.append("   ]");
+        }
+        out.append(")\n");
+        out.append("}\n");
+        return out.toString();
+    }
+
+    private static ReMoDeLEntity synthesizeProcessContainer(List<ReMoDeLEntity> actionNodes, String diagramName) {
+        double minX = Double.POSITIVE_INFINITY;
+        double minY = Double.POSITIVE_INFINITY;
+        double maxX = Double.NEGATIVE_INFINITY;
+        double maxY = Double.NEGATIVE_INFINITY;
+
+        for (ReMoDeLEntity action : actionNodes) {
+            java.awt.geom.Rectangle2D bounds = entityBounds(action);
+            if (bounds == null) continue;
+            minX = Math.min(minX, bounds.getMinX());
+            minY = Math.min(minY, bounds.getMinY());
+            maxX = Math.max(maxX, bounds.getMaxX());
+            maxY = Math.max(maxY, bounds.getMaxY());
+        }
+
+        if (!Double.isFinite(minX) || !Double.isFinite(minY) || !Double.isFinite(maxX) || !Double.isFinite(maxY)) {
+            minX = 0.0;
+            minY = 0.0;
+            maxX = 400.0;
+            maxY = 250.0;
+        }
+
+        double padX = Math.max(80.0, (maxX - minX) * 0.20);
+        double padY = Math.max(60.0, (maxY - minY) * 0.20);
+
+        ReMoDeLEntity process = new ReMoDeLEntity();
+        process.setType("shape");
+        process.put("shapeType", "PROCESS");
+        process.put("text", deriveProcessNameFromActions(actionNodes, diagramName));
+        process.put("x1", (int) Math.round(minX - padX));
+        process.put("y1", (int) Math.round(minY - padY));
+        process.put("x2", (int) Math.round(maxX + padX));
+        process.put("y2", (int) Math.round(maxY + padY));
+        return process;
+    }
+
+    private static String deriveProcessNameFromActions(List<ReMoDeLEntity> actionNodes, String diagramName) {
+        if (actionNodes == null || actionNodes.isEmpty()) {
+            return diagramName == null || diagramName.isBlank() ? "Process" : diagramName.trim();
+        }
+
+        String firstAction = firstLine(asText(actionNodes.get(0).get("text")));
+        if (firstAction == null || firstAction.isBlank()) {
+            return diagramName == null || diagramName.isBlank() ? "Process" : diagramName.trim();
+        }
+
+        String cleaned = firstAction.trim();
+        String[] prefixes = { "Input ", "Output ", "Fetch ", "Create ", "Update ", "Store ", "Delete ", "Process " };
+        for (String prefix : prefixes) {
+            if (cleaned.regionMatches(true, 0, prefix, 0, prefix.length())) {
+                cleaned = cleaned.substring(prefix.length()).trim();
+                break;
+            }
+        }
+
+        if (cleaned.isBlank()) {
+            return diagramName == null || diagramName.isBlank() ? "Process" : diagramName.trim();
+        }
+        return cleaned;
     }
 
     private static String buildObjectModelDsl(
@@ -276,12 +508,16 @@ public class ReMoDeLExporter {
             .collect(Collectors.toList());
 
         List<String> objectEntries = new ArrayList<>();
-        List<String> propertyEntries = new ArrayList<>();
+
+
+        Map<String, String> objectNameById = new java.util.LinkedHashMap<>();
+        Map<String, List<String>> localPropsById = new java.util.LinkedHashMap<>();
         for (ReMoDeLEntity node : objectNodes) {
             String token = nextToken(counters, "o");
             objectTokenById.put(node.getId(), token);
             String name = firstLine(asText(node.get("text")));
             if (name == null || name.isBlank()) name = "ObjectType " + token.substring(1);
+            objectNameById.put(node.getId(), name);
 
             String text = asText(node.get("text"));
             String[] lines = text == null ? new String[0] : text.split("\\R");
@@ -310,25 +546,10 @@ public class ReMoDeLExporter {
                 if (id) property.append(", id = true");
                 property.append(", type = ").append(attrType).append(")");
                 localProperties.add(property.toString());
-                propertyEntries.add(property.toString());
             }
-
-            StringBuilder object = new StringBuilder();
-            object.append(token).append(" : ObjectType(name = \"").append(escapeDsl(name)).append("\"");
-            if (!localProperties.isEmpty()) {
-                object.append(", properties = Property[\n");
-                for (int i = 0; i < localProperties.size(); i++) {
-                    object.append("         ").append(localProperties.get(i));
-                    if (i < localProperties.size() - 1) object.append(",");
-                    object.append("\n");
-                }
-                object.append("      ]");
-            }
-            object.append(")");
-            objectEntries.add(object.toString());
+            localPropsById.put(node.getId(), localProperties);
         }
 
-        List<String> referenceEntries = new ArrayList<>();
         List<String> generalisationEntries = new ArrayList<>();
         for (ReMoDeLEntity connector : connectors) {
             String shape = getShapeType(connector);
@@ -343,12 +564,47 @@ public class ReMoDeLExporter {
             if ("REFERENCE".equals(shape)) {
                 String token = nextToken(counters, "r");
                 String name = inferReferenceName(asText(connector.get("text")), targetToken);
-                referenceEntries.add(token + " : Reference(name = \"" + escapeDsl(name)
-                    + "\", type = " + targetToken + ")");
+                List<String> props = localPropsById.get(sourceId);
+                if (props == null) {
+                    props = new ArrayList<>();
+                    localPropsById.put(sourceId, props);
+                }
+                StringBuilder refProp = new StringBuilder();
+                refProp.append(token).append(" : Reference(name = \"").append(escapeDsl(name)).append("\"");
+                String label = asText(connector.get("text"));
+                String first = firstLine(label);
+                if (first != null && first.trim().startsWith("*")) refProp.append(", id = true");
+                String refType = inferTypeFromLabelOrTarget(label, targetToken);
+                refProp.append(", type = ").append(refType);
+                if (isKindOfQualifier(label)) refProp.append(", kindOf = true");
+                refProp.append(")");
+                props.add(refProp.toString());
             } else if ("ARROW_EMPTY".equals(shape)) {
                 String token = nextToken(counters, "g");
                 generalisationEntries.add(token + " : Generalisation(source = " + sourceToken + ", target = " + targetToken + ")");
             }
+        }
+
+
+        for (ReMoDeLEntity node : objectNodes) {
+            String id = node.getId();
+            String token = objectTokenById.get(id);
+            String name = objectNameById.get(id);
+            List<String> props = localPropsById.getOrDefault(id, java.util.Collections.emptyList());
+
+            StringBuilder object = new StringBuilder();
+            object.append(token).append(" : ObjectType(name = \"").append(escapeDsl(name)).append("\"");
+            if (!props.isEmpty()) {
+                object.append(", properties = Property[\n");
+                for (int i = 0; i < props.size(); i++) {
+                    object.append("         ").append(props.get(i));
+                    if (i < props.size() - 1) object.append(",");
+                    object.append("\n");
+                }
+                object.append("      ]");
+            }
+            object.append(")");
+            objectEntries.add(object.toString());
         }
 
         StringBuilder out = new StringBuilder();
@@ -368,15 +624,6 @@ public class ReMoDeLExporter {
             for (int i = 0; i < objectEntries.size(); i++) {
                 out.append("      ").append(objectEntries.get(i));
                 if (i < objectEntries.size() - 1) out.append(",");
-                out.append("\n");
-            }
-            out.append("   ]");
-        }
-        if (!referenceEntries.isEmpty()) {
-            out.append(", references = Reference[\n");
-            for (int i = 0; i < referenceEntries.size(); i++) {
-                out.append("      ").append(referenceEntries.get(i));
-                if (i < referenceEntries.size() - 1) out.append(",");
                 out.append("\n");
             }
             out.append("   ]");
@@ -441,7 +688,7 @@ public class ReMoDeLExporter {
             stateTokenById.put(node.getId(), token);
         }
 
-        // Re-run actor bindings once state tokens are known.
+
         stateActors.clear();
         for (ReMoDeLEntity connector : connectors) {
             if (!"AUTHORISATION".equals(getShapeType(connector))) continue;
@@ -595,11 +842,6 @@ public class ReMoDeLExporter {
         return "b5";
     }
 
-    private static String[] splitLines(String text) {
-        if (text == null || text.isBlank()) return new String[0];
-        return text.split("\\R");
-    }
-
     private static String defaultTransitionName(String shapeType) {
         if ("INITIAL_TRANSITION".equals(shapeType)) return "entry";
         if ("FINAL_TRANSITION".equals(shapeType)) return "exit";
@@ -715,7 +957,8 @@ public class ReMoDeLExporter {
             case TASK_MODEL:
             default:
                 collections.add(buildNodeCollection("actors", "Actor", nodes, nodeTokenById, prefixCounters, "a", "Actor", "ACTOR"));
-                collections.add(buildNodeCollection("tasks", "Task", nodes, nodeTokenById, prefixCounters, "t", "Task", "TASK", "SYSTEM", "BOUNDARY"));
+                collections.add(buildSystemActorCollection(nodes, nodeTokenById, prefixCounters));
+                collections.add(buildNodeCollection("tasks", "Task", nodes, nodeTokenById, prefixCounters, "t", "Task", "TASK", "BOUNDARY"));
                 collections.add(buildConnectorCollection("associations", "Association", connectors, nodeTokenById, prefixCounters, "a", "LINE", false, null));
                 collections.add(buildConnectorCollection("associations", "Association", connectors, nodeTokenById, prefixCounters, "a", "ENACTS", true, null));
                 collections.add(buildConnectorCollection("compositions", "Composition", connectors, nodeTokenById, prefixCounters, "c", "ARROW_DIAMOND", false, null));
@@ -771,6 +1014,34 @@ public class ReMoDeLExporter {
             java.util.LinkedHashMap<String, ModValue> fields = new java.util.LinkedHashMap<>();
             fields.put("name", new ModValue(name, false));
             collection.entries.add(buildEntry(token, elementType, fields));
+        }
+        return collection;
+    }
+
+    private static ModCollection buildSystemActorCollection(
+            List<ReMoDeLEntity> nodes,
+            Map<String, String> nodeTokenById,
+            Map<String, Integer> prefixCounters) {
+
+        ModCollection collection = new ModCollection("actors", "Actor");
+        int unnamedCount = 0;
+        for (ReMoDeLEntity node : nodes) {
+            String shapeType = getShapeType(node);
+            if (!"SYSTEM".equals(shapeType)) continue;
+
+            String token = nextToken(prefixCounters, "a");
+            nodeTokenById.put(node.getId(), token);
+
+            String name = firstLine(asText(node.get("text")));
+            if (name == null || name.isBlank()) {
+                unnamedCount++;
+                name = "System " + unnamedCount;
+            }
+
+            java.util.LinkedHashMap<String, ModValue> fields = new java.util.LinkedHashMap<>();
+            fields.put("name", new ModValue(name, false));
+            fields.put("system", new ModValue("true", true));
+            collection.entries.add(buildEntry(token, "Actor", fields));
         }
         return collection;
     }
@@ -917,6 +1188,258 @@ public class ReMoDeLExporter {
             collection.entries.add(buildEntry(token, "Process", fields));
         }
         return collection;
+    }
+
+    private enum ProcessDatumKind {
+        OBJECT,
+        CONTENT,
+        IDENTITY
+    }
+
+    private static class ProcessDatumParts {
+        final String name;
+        final String subtypes;
+        final String annotation;
+
+        ProcessDatumParts(String name, String subtypes, String annotation) {
+            this.name = name;
+            this.subtypes = subtypes;
+            this.annotation = annotation;
+        }
+    }
+
+    private static String actionPrefix(ActionKind kind) {
+        if (kind == null) return "a";
+        switch (kind) {
+            case INPUT: return "i";
+            case OUTPUT: return "o";
+            case FETCH: return "f";
+            case STORE: return "s";
+            case CREATE: return "c";
+            case UPDATE: return "u";
+            case DELETE: return "d";
+            default: return "a";
+        }
+    }
+
+    private static String datumPrefix(ProcessDatumKind kind) {
+        if (kind == null) return "o";
+        switch (kind) {
+            case IDENTITY: return "i";
+            case CONTENT: return "c";
+            case OBJECT:
+            default: return "o";
+        }
+    }
+
+    private static String datumElementType(ProcessDatumKind kind) {
+        if (kind == null) return "Object";
+        switch (kind) {
+            case IDENTITY: return "Identity";
+            case CONTENT: return "Content";
+            case OBJECT:
+            default: return "Object";
+        }
+    }
+
+    private static String inferProcessKind(java.util.List<ActionKind> actionKinds) {
+        boolean hasCreate = false;
+        boolean hasUpdate = false;
+        boolean hasDelete = false;
+        boolean hasFetch = false;
+        boolean hasOutput = false;
+
+        for (ActionKind kind : actionKinds) {
+            if (kind == null) continue;
+            switch (kind) {
+                case CREATE:
+                    hasCreate = true;
+                    break;
+                case UPDATE:
+                    hasUpdate = true;
+                    break;
+                case DELETE:
+                    hasDelete = true;
+                    break;
+                case FETCH:
+                    hasFetch = true;
+                    break;
+                case OUTPUT:
+                    hasOutput = true;
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        if (hasDelete) return "delete";
+        if (hasUpdate) return "update";
+        if (hasCreate) return "create";
+        if (hasFetch || hasOutput) return "read";
+        return "create";
+    }
+
+    private static boolean looksLikeIdentifierAction(String actionName) {
+        if (actionName == null) return false;
+        return actionName.toLowerCase().contains("id");
+    }
+
+    private static boolean looksLikeArchiveAction(String processName, String actionName) {
+        String process = processName == null ? "" : processName.toLowerCase();
+        String action = actionName == null ? "" : actionName.toLowerCase();
+        return process.contains("discharge") || action.contains("archive");
+    }
+
+    private static ProcessDatumParts parseProcessDatumParts(String label) {
+        String raw = label != null ? label.trim() : "";
+        String annotation = "";
+        if (raw.endsWith("{val}")) {
+            annotation = "{val}";
+            raw = raw.substring(0, raw.length() - 5).trim();
+        } else if (raw.endsWith("{id}")) {
+            annotation = "{id}";
+            raw = raw.substring(0, raw.length() - 4).trim();
+        }
+
+        String subtypes = "";
+        int open = raw.indexOf('(');
+        int close = raw.lastIndexOf(')');
+        if (open > 0 && close > open) {
+            subtypes = raw.substring(open + 1, close).trim();
+            raw = raw.substring(0, open).trim();
+        }
+
+        if (raw.isBlank()) raw = "Object";
+        return new ProcessDatumParts(raw, subtypes, annotation);
+    }
+
+    private static ProcessDatumKind inferProcessDatumKind(ProcessDatumParts parts, ActionKind sourceKind, ActionKind targetKind) {
+        if (parts != null && parts.annotation != null) {
+            String annotation = parts.annotation.trim().toLowerCase();
+            if (annotation.equals("{id}")) return ProcessDatumKind.IDENTITY;
+            if (annotation.equals("{val}")) return ProcessDatumKind.CONTENT;
+        }
+
+        String explicit = parts != null && parts.name != null ? parts.name.trim().toLowerCase() : "";
+        if (explicit.equals("identity")) return ProcessDatumKind.IDENTITY;
+        if (explicit.equals("content")) return ProcessDatumKind.CONTENT;
+        if (explicit.equals("object")) return ProcessDatumKind.OBJECT;
+
+        if (sourceKind == ActionKind.INPUT) {
+            if (targetKind == ActionKind.FETCH || targetKind == ActionKind.OUTPUT || targetKind == ActionKind.DELETE) {
+                return ProcessDatumKind.IDENTITY;
+            }
+            if (targetKind == ActionKind.CREATE || targetKind == ActionKind.UPDATE) {
+                return ProcessDatumKind.CONTENT;
+            }
+        }
+
+        if (parts != null && parts.subtypes != null && !parts.subtypes.isBlank()) {
+            return ProcessDatumKind.OBJECT;
+        }
+
+        return ProcessDatumKind.OBJECT;
+    }
+
+    private static String inferProcessDatumName(
+            ProcessDatumParts parts,
+            String rawLabel,
+            ActionKind sourceKind,
+            ActionKind targetKind,
+            String sourceActionName,
+            String targetActionName) {
+
+        String explicit = parts != null && parts.name != null ? parts.name.trim() : "";
+        if (!explicit.isBlank() && !isGenericDatumName(explicit)) {
+            return explicit;
+        }
+
+        String sourceGuess = extractDomainNameFromAction(sourceActionName, sourceKind);
+        String targetGuess = extractDomainNameFromAction(targetActionName, targetKind);
+
+        if (!sourceGuess.isBlank()) return sourceGuess;
+        if (!targetGuess.isBlank()) return targetGuess;
+
+        if (explicit.isBlank()) {
+            ProcessDatumParts fallback = parseProcessDatumParts(rawLabel);
+            if (fallback.name != null && !fallback.name.isBlank()) return fallback.name;
+        }
+        return explicit.isBlank() ? "Object" : explicit;
+    }
+
+    private static boolean isGenericDatumName(String name) {
+        if (name == null) return true;
+        String lower = name.trim().toLowerCase();
+        return lower.isEmpty() || lower.equals("object") || lower.equals("content") || lower.equals("identity");
+    }
+
+    private static String extractDomainNameFromAction(String actionName, ActionKind kind) {
+        if (actionName == null || actionName.isBlank()) return "";
+        String cleaned = actionName.trim();
+        String[] prefixes = { "Input", "Output", "Fetch", "Create", "Update", "Store", "Delete" };
+        for (String prefix : prefixes) {
+            if (cleaned.regionMatches(true, 0, prefix, 0, prefix.length())) {
+                cleaned = cleaned.substring(prefix.length()).trim();
+                break;
+            }
+        }
+        cleaned = cleaned.replaceAll("(?i)\\b(values?|id)\\b", "");
+        cleaned = cleaned.replaceAll("[\\p{Punct}]+$", "").trim();
+        if (cleaned.isBlank()) return "";
+        return cleaned;
+    }
+
+    private static ReMoDeLEntity findContainingProcess(ReMoDeLEntity action, java.util.List<ReMoDeLEntity> processes) {
+        if (action == null || processes == null || processes.isEmpty()) return null;
+
+        java.awt.geom.Rectangle2D actionBounds = entityBounds(action);
+        if (actionBounds == null) return null;
+
+        ReMoDeLEntity best = null;
+        double bestArea = Double.POSITIVE_INFINITY;
+        for (ReMoDeLEntity process : processes) {
+            java.awt.geom.Rectangle2D processBounds = entityBounds(process);
+            if (processBounds == null) continue;
+            
+
+
+            double margin = 8.0;
+            double processLeft = processBounds.getMinX() + margin;
+            double processTop = processBounds.getMinY() + margin;
+            double processRight = processBounds.getMaxX() - margin;
+            double processBottom = processBounds.getMaxY() - margin;
+            
+            double actionLeft = actionBounds.getMinX();
+            double actionTop = actionBounds.getMinY();
+            double actionRight = actionBounds.getMaxX();
+            double actionBottom = actionBounds.getMaxY();
+            
+
+            if (actionLeft < processLeft || actionRight > processRight || 
+                actionTop < processTop || actionBottom > processBottom) {
+                continue;
+            }
+
+            double area = Math.max(0.0, processBounds.getWidth()) * Math.max(0.0, processBounds.getHeight());
+            if (area < bestArea) {
+                bestArea = area;
+                best = process;
+            }
+        }
+        return best;
+    }
+
+    private static java.awt.geom.Rectangle2D entityBounds(ReMoDeLEntity entity) {
+        if (entity == null) return null;
+        double x1 = intProp(entity, "x1");
+        double y1 = intProp(entity, "y1");
+        double x2 = intProp(entity, "x2");
+        double y2 = intProp(entity, "y2");
+        double left = Math.min(x1, x2);
+        double top = Math.min(y1, y2);
+        double width = Math.abs(x2 - x1);
+        double height = Math.abs(y2 - y1);
+        return new java.awt.geom.Rectangle2D.Double(left, top, width, height);
     }
 
     private static ActionLabelParts parseActionLabel(String label) {
@@ -1069,7 +1592,7 @@ public class ReMoDeLExporter {
         name = name.trim();
         if (name.isBlank()) return null;
 
-        // Keep exact file base when it's already a valid DSL identifier.
+
         if (name.matches("[A-Za-z_][A-Za-z0-9_]*")) return name;
 
         String sanitized = sanitizeIdentifier(name);
@@ -1077,25 +1600,7 @@ public class ReMoDeLExporter {
     }
 
     private static String inferDiagramName(ModelKind kind, List<ReMoDeLEntity> nodes) {
-        String preferredShape;
-        switch (kind) {
-            case TASK_MODEL:
-                preferredShape = "SYSTEM";
-                break;
-            case PROCESS_MODEL:
-                preferredShape = "PROCESS";
-                break;
-            case STATE_MODEL:
-                preferredShape = "STATE";
-                break;
-            case OBJECT_MODEL:
-                preferredShape = "OBJECT_TYPE";
-                break;
-            case IMPACT_MODEL:
-            default:
-                preferredShape = "TASK";
-                break;
-        }
+        String preferredShape = "BOUNDARY";
 
         for (ReMoDeLEntity node : nodes) {
             if (!preferredShape.equals(getShapeType(node))) continue;
@@ -1164,63 +1669,6 @@ public class ReMoDeLExporter {
         return s.isBlank() ? null : s;
     }
 
-    private static String inferMetamodelName(List<ReMoDeLEntity> all) {
-        for (ReMoDeLEntity e : all) {
-            if (isConnectorEntity(e)) continue;
-            if (!"BOUNDARY".equals(getShapeType(e))) continue;
-            String text = asText(e.get("text"));
-            if (text == null || text.isBlank()) continue;
-            String name = sanitizeIdentifier(firstLine(text));
-            if (!name.isBlank()) return name;
-        }
-        return "ExportedModel";
-    }
-
-    private static String inferConceptName(ReMoDeLEntity e) {
-        String text = asText(e.get("text"));
-        if (text == null || text.isBlank()) return sanitizeIdentifier(e.getId());
-        return sanitizeIdentifier(firstLine(text));
-    }
-
-    private static List<String> inferConceptBodyLines(ReMoDeLEntity e) {
-        List<String> lines = new ArrayList<>();
-        String text = asText(e.get("text"));
-        if (text == null || text.isBlank()) return lines;
-
-        String[] parts = text.split("\\R");
-        for (int i = 1; i < parts.length; i++) {
-            String raw = parts[i].trim();
-            if (raw.isEmpty()) continue;
-            if (raw.startsWith("*")) raw = raw.substring(1).trim();
-
-            if (raw.startsWith("attribute ") || raw.startsWith("reference ") || raw.startsWith("component ") || raw.startsWith("operation ")) {
-                lines.add(raw);
-                continue;
-            }
-
-            if (raw.contains(":")) {
-                lines.add("attribute " + normalizeTypeDeclaration(raw));
-            } else {
-                lines.add("attribute " + sanitizeIdentifier(raw) + " : String");
-            }
-        }
-        return lines;
-    }
-
-    private static String inferReferenceName(String label, String targetType) {
-        String first = firstLine(label);
-        if (first == null || first.isBlank()) return lowerFirst(targetType);
-        String cleaned = first.trim();
-        if (cleaned.startsWith("*")) cleaned = cleaned.substring(1).trim();
-
-        // If label already includes multiplicity suffix, trim only for the field name.
-        if (cleaned.endsWith("[]")) cleaned = cleaned.substring(0, cleaned.length() - 2).trim();
-        if (cleaned.contains(":")) cleaned = cleaned.substring(0, cleaned.indexOf(':')).trim();
-        cleaned = sanitizeMemberIdentifier(cleaned);
-        if (cleaned.isBlank()) return lowerFirst(targetType);
-        return cleaned;
-    }
-
     private static String inferTypeFromLabelOrTarget(String label, String targetType) {
         String first = firstLine(label);
         if (first == null) return targetType;
@@ -1239,6 +1687,22 @@ public class ReMoDeLExporter {
         if (second == null) return false;
         String q = second.trim().toLowerCase();
         return q.equals("{kindof}") || q.equals("kindof") || q.equals("{kind_of}") || q.equals("kind_of");
+    }
+
+    private static String inferReferenceName(String label, String targetToken) {
+        String first = firstLine(label);
+        if (first == null || first.isBlank()) {
+            if (targetToken != null && targetToken.length() > 1) return lowerFirst(targetToken.substring(1));
+            return "ref";
+        }
+        String cleaned = first.trim();
+        if (cleaned.startsWith("*")) cleaned = cleaned.substring(1).trim();
+        if (cleaned.contains(":")) cleaned = cleaned.substring(0, cleaned.indexOf(':')).trim();
+        if (cleaned.isEmpty()) {
+            if (targetToken != null && targetToken.length() > 1) return lowerFirst(targetToken.substring(1));
+            return "ref";
+        }
+        return sanitizeMemberIdentifier(cleaned);
     }
 
     private static String getShapeType(ReMoDeLEntity e) {
@@ -1306,11 +1770,6 @@ public class ReMoDeLExporter {
         String v = declaration.trim().replaceAll("\\s+", " ");
         v = v.replace(" :", ":").replace(":", " : ");
         return v.trim();
-    }
-
-    private static void addUnique(List<String> list, String value) {
-        if (value == null || value.isBlank()) return;
-        if (!list.contains(value)) list.add(value);
     }
 
     private static String entityToXML(ReMoDeLEntity entity, int indent) {

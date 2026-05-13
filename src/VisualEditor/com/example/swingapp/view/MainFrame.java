@@ -1,9 +1,15 @@
 package com.example.swingapp.view;
 
-import java.awt.*;
+import java.awt.BorderLayout;
 import java.util.Objects;
-import javax.swing.*;
 
+import javax.swing.JFrame;
+import javax.swing.JLabel;
+import javax.swing.JScrollPane;
+
+/**
+ * Top-level application window that composes toolbar, canvas, and status bar.
+ */
 public class MainFrame extends JFrame {
     private final DrawingCanvas canvas;
     private final ToolBarShell toolbar;
@@ -21,7 +27,7 @@ public class MainFrame extends JFrame {
         setJMenuBar(toolbar.createMenuBar(this));
         add(new JScrollPane(canvas), BorderLayout.CENTER);
 
-        // optional status bar
+
         JLabel status = new JLabel("Ready");
         canvas.addStatusConsumer(status::setText);
         add(status, BorderLayout.SOUTH);

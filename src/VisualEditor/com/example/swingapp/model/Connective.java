@@ -1,7 +1,8 @@
 package com.example.swingapp.model;
 
+
 /**
- * Represents a Connective linking two entities (e.g. concept->concept)
+ * Domain entity representing a directed relationship between two nodes.
  */
 public class Connective extends ReMoDeLEntity {
     public Connective() {

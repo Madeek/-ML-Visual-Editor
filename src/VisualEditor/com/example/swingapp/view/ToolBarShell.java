@@ -48,6 +48,9 @@ import javax.swing.SwingUtilities;
 import com.example.swingapp.model.ReMoDeLModel;
 import com.example.swingapp.persistence.ReMoDeLExporter;
 
+/**
+ * Builds and coordinates the menu/toolbar controls for the drawing canvas.
+ */
 public class ToolBarShell {
     private final JPanel toolPanel;
     private final JToolBar toolBar;
@@ -187,7 +190,7 @@ public class ToolBarShell {
         bottomBar.setFloatable(false);
         toolBar.setFloatable(false);
 
-        // wrapper that stacks two horizontal toolbars
+
         JPanel rows = new JPanel(new GridLayout(2, 1, 0, 0));
         rows.add(toolBar);
         rows.add(bottomBar);
@@ -204,7 +207,7 @@ public class ToolBarShell {
         canvas.setImpactLabel("create");
         canvas.setDataflowKind(DrawingCanvas.DataflowKind.OBJECT);
 
-        // Model selector 
+
         JLabel modelLabel = new JLabel("Model:");
         modelSelector = new JComboBox<>(ModelType.values());
         modelSelector.setSelectedItem(ModelType.TASK_MODEL);
@@ -212,13 +215,13 @@ public class ToolBarShell {
         toolBar.add(modelLabel);
         toolBar.add(modelSelector);
 
-        // Clear button
+
         JButton clearBtn = new JButton("Clear Canvas");
         clearBtn.setToolTipText("Remove all shapes from the canvas");
         clearBtn.addActionListener(e -> canvas.clear());
         toolBar.add(clearBtn);
 
-        // Selection tool (default) - use toggle buttons for tools so selection is visible
+
         JToggleButton selectBtn = new JToggleButton("Select", new ToolIcon(IconKind.SELECT));
         selectBtn.addActionListener(e -> canvas.setCurrentTool(DrawingCanvas.Tool.SELECT));
         toolGroup.add(selectBtn);
@@ -226,13 +229,13 @@ public class ToolBarShell {
         selectBtn.setSelected(true);
         toolBar.add(selectBtn);
 
-        // TODO: Finish implementing the pan tool
-        // Pan tool (drag-move entity and its attached connectors)
-        // JToggleButton panBtn = new JToggleButton("Pan", new ToolIcon(IconKind.PAN));
-        // panBtn.addActionListener(e -> canvas.setCurrentTool(DrawingCanvas.Tool.PAN));
-        // toolGroup.add(panBtn);
-        // toolButtons.put(DrawingCanvas.Tool.PAN, panBtn);
-        // toolBar.add(panBtn);
+
+
+        JToggleButton panBtn = new JToggleButton("Pan", new ToolIcon(IconKind.PAN));
+        panBtn.addActionListener(e -> canvas.setCurrentTool(DrawingCanvas.Tool.PAN));
+        toolGroup.add(panBtn);
+        toolButtons.put(DrawingCanvas.Tool.PAN, panBtn);
+        toolBar.add(panBtn);
 
         toolBar.addSeparator();
         toolBar.add(new JLabel("Zoom:"));
@@ -265,10 +268,10 @@ public class ToolBarShell {
         });
 
 
-        // initial tool set
+
         rebuildModelTools(ModelType.TASK_MODEL);
 
-        // listen for canvas tool changes so toolbar highlights stay in sync
+
         canvas.addPropertyChangeListener("currentTool", new PropertyChangeListener() {
             @Override
             public void propertyChange(PropertyChangeEvent evt) {
@@ -278,7 +281,7 @@ public class ToolBarShell {
                     JToggleButton btn = toolButtons.get(t);
                     if (btn != null && !btn.isSelected()) btn.setSelected(true);
 
-                    // attach/remove text placer listener based on tool
+
                     if (t == DrawingCanvas.Tool.SELECT) {
                         canvas.setCursor(Cursor.getPredefinedCursor(Cursor.DEFAULT_CURSOR));
                     } else if (t == DrawingCanvas.Tool.PAN) {
@@ -301,12 +304,12 @@ public class ToolBarShell {
         JMenuBar menuBar = new JMenuBar();
         int shortcutMask = Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx();
 
-        // --- File menu
+
         JMenu fileMenu = new JMenu("File");
         JMenuItem newItem = new JMenuItem("New");
         newItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_N, shortcutMask));
         newItem.addActionListener(e -> {
-            // Clear the canvas for a new document
+
             canvas.clear();
             currentDrawingFile = null;
         });
@@ -358,7 +361,7 @@ public class ToolBarShell {
                     }
                 }
                 try {
-                    // Validate completeness rules for the chosen model kind and warn the user
+
                     java.util.List<String> warnings = canvas.validateCompleteness(currentModelKind());
                     if (!warnings.isEmpty()) {
                         StringBuilder sb = new StringBuilder();
@@ -398,12 +401,12 @@ public class ToolBarShell {
         });
         fileMenu.add(exitItem);
 
-        // --- Edit menu
+
         JMenu editMenu = new JMenu("Edit");
 
         JMenuItem undoItem = new JMenuItem("Undo");
 
-        // use platform menu shortcut (Ctrl on Win/Linux, Cmd on macOS)
+
         undoItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_Z, shortcutMask));
         undoItem.addActionListener(e -> canvas.undo());
         undoItem.setEnabled(canvas.canUndo());
@@ -444,18 +447,18 @@ public class ToolBarShell {
         pasteItem.addActionListener(e -> canvas.pasteClipboardShape());
         editMenu.add(pasteItem);
 
-        // --- View menu
+
         JMenu viewMenu = new JMenu("View");
         JCheckBoxMenuItem showTools = new JCheckBoxMenuItem("Show Tools", true);
         showTools.addActionListener(e -> toolPanel.setVisible(showTools.isSelected()));
         viewMenu.add(showTools);
 
-        // Add menus to bar
+
         menuBar.add(fileMenu);
         menuBar.add(editMenu);
         menuBar.add(viewMenu);
 
-        // listen for canvas undo/redo availability changes
+
         canvas.addPropertyChangeListener(new PropertyChangeListener() {
             @Override
             public void propertyChange(PropertyChangeEvent evt) {
@@ -605,6 +608,7 @@ public class ToolBarShell {
             case IMPACT_MODEL:
                 addToolButton(bottomBar, DrawingCanvas.Tool.TASK, "Task", IconKind.TASK);
                 addToolButton(bottomBar, DrawingCanvas.Tool.OBJECT, "Object", IconKind.RECT);
+                addToolButton(bottomBar, DrawingCanvas.Tool.BOUNDARY, "Boundary", IconKind.BOUNDARY);
                 addToolButton(bottomBar, DrawingCanvas.Tool.ARROW_EMPTY, "Generalisation", IconKind.ARROW_EMPTY);
                 addToolButton(bottomBar, DrawingCanvas.Tool.IMPACT, "Impact", IconKind.IMPACT);
                 impactSelector = new JComboBox<>(ImpactKind.values());
@@ -620,6 +624,7 @@ public class ToolBarShell {
             case STATE_MODEL:
                 addToolButton(bottomBar, DrawingCanvas.Tool.STATE, "State", IconKind.STATE);
                 addToolButton(bottomBar, DrawingCanvas.Tool.ACTOR, "Actor", IconKind.ACTOR);
+                addToolButton(bottomBar, DrawingCanvas.Tool.BOUNDARY, "Boundary", IconKind.BOUNDARY);
                 addToolButton(bottomBar, DrawingCanvas.Tool.ARROW_OPEN, "Transition", IconKind.ARROW_OPEN);
                 addToolButton(bottomBar, DrawingCanvas.Tool.INITIAL_TRANSITION, "Initial", IconKind.INITIAL_TRANSITION);
                 addToolButton(bottomBar, DrawingCanvas.Tool.FINAL_TRANSITION, "Final", IconKind.FINAL_TRANSITION);
@@ -637,6 +642,7 @@ public class ToolBarShell {
                     canvas.setCurrentTool(DrawingCanvas.Tool.ACTION);
                 });
                 bottomBar.add(processActionSelector);
+                addToolButton(bottomBar, DrawingCanvas.Tool.BOUNDARY, "Boundary", IconKind.BOUNDARY);
                 addToolButton(bottomBar, DrawingCanvas.Tool.ARROW_FILLED, "Dataflow", IconKind.ARROW_FILLED);
                 dataflowSelector = new JComboBox<>(DataflowKind.values());
                 dataflowSelector.setSelectedItem(DataflowKind.OBJECT);
@@ -662,6 +668,7 @@ public class ToolBarShell {
                     }
                 });
                 bottomBar.add(objectTypeCountSpinner);
+                addToolButton(bottomBar, DrawingCanvas.Tool.BOUNDARY, "Boundary", IconKind.BOUNDARY);
                 addToolButton(bottomBar, DrawingCanvas.Tool.ARROW_EMPTY, "Generalisation", IconKind.ARROW_EMPTY);
                 addToolButton(bottomBar, DrawingCanvas.Tool.ARROW_DIAMOND, "Composition", IconKind.ARROW_DIAMOND);
                 bottomBar.addSeparator();
@@ -735,7 +742,7 @@ public class ToolBarShell {
                     cursor.addPoint(cx + 5, cy);
                     cursor.addPoint(cx, cy + 12);
                     cursor.addPoint(cx + 5, cy + 7);
-                    // cursor.addPoint(cx + 6, cy + 8);
+
                     cursor.addPoint(cx + 10, cy + 12);
 
                     g2.setColor(Color.WHITE);
@@ -810,7 +817,7 @@ public class ToolBarShell {
                     g2.drawRect(cx + 3, cy + 3, w - 6, h - 6);
                     break;
                 case BOUNDARY:
-                    // Rectangle with tab at top-left
+
                     int tabW = 6;
                     int tabH = 4;
                     g2.drawRect(cx, cy + tabH, w, h - tabH);
@@ -829,20 +836,20 @@ public class ToolBarShell {
                     g2.setStroke(oldStroke);
                     break;
                 case INITIAL_TRANSITION:
-                    // Filled circle on left, arrow on right
+
                     g2.fillOval(cx, cy + h / 2 - 3, 6, 6);
                     g2.drawLine(cx + 6, cy + h / 2, cx + w - 4, cy + h / 2);
-                    // Arrow head
+
                     g2.drawLine(cx + w, cy + h / 2, cx + w - 4, cy + h / 2 - 3);
                     g2.drawLine(cx + w, cy + h / 2, cx + w - 4, cy + h / 2 + 3);
                     break;
                 case FINAL_TRANSITION:
-                    // Line with arrow, circle with cross on right
+
                     g2.drawLine(cx, cy + h / 2, cx + w - 6, cy + h / 2);
-                    // Arrow head
+
                     g2.drawLine(cx + w - 6, cy + h / 2, cx + w - 10, cy + h / 2 - 3);
                     g2.drawLine(cx + w - 6, cy + h / 2, cx + w - 10, cy + h / 2 + 3);
-                    // Circle with cross
+
                     int circleR = 4;
                     g2.drawOval(cx + w - circleR, cy + h / 2 - circleR, circleR * 2, circleR * 2);
                     g2.drawLine(cx + w - 2, cy + h / 2 - 2, cx + w + 2, cy + h / 2 + 2);

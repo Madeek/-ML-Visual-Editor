@@ -6,8 +6,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 
+
 /**
- * Base data-only entity for the ReMoDeL model.
+ * Serializable base entity used by the in-memory model and persistence layer.
  */
 public class ReMoDeLEntity implements Serializable {
     private static final long serialVersionUID = 1L;
@@ -78,8 +79,9 @@ public class ReMoDeLEntity implements Serializable {
         return "ReMoDeLEntity{" + "id='" + id + '\'' + ", type='" + type + '\'' + '}';
     }
 
+
     /**
-     * Shallow copy of this entity (properties map is cloned shallowly).
+     * Creates a shallow copy with a cloned property map.
      */
     public ReMoDeLEntity copy() {
         ReMoDeLEntity r = new ReMoDeLEntity(this.id);

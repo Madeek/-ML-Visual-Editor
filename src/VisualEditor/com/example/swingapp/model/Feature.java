@@ -1,7 +1,8 @@
 package com.example.swingapp.model;
 
+
 /**
- * Represents a Feature attached to a Concept or other entity.
+ * Domain entity representing an attribute-style feature value.
  */
 public class Feature extends ReMoDeLEntity {
     public Feature() {

@@ -1,7 +1,8 @@
 package com.example.swingapp.model;
 
+
 /**
- * Represents a Concept in the ReMoDeL domain.
+ * Domain entity representing a concept node in the visual model.
  */
 public class Concept extends ReMoDeLEntity {
     public Concept() {
